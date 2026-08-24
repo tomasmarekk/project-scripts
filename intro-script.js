@@ -58,7 +58,7 @@
     incomingYPercent: 125,
     outgoingRotation: 3,
     incomingRotation: -3,
-    inactiveExitDelayProgress: 0.2,
+    inactiveExitDelayProgress: 0.4,
     finalPhaseExitTolerance: 0,
     scrollDirectionEpsilon: 0.5,
     topEnterTolerance: 1,
