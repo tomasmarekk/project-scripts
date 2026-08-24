@@ -63,10 +63,7 @@
     topEnterTolerance: 1,
     topLeaveTolerance: 2,
     assetWaitTimeout: 6000,
-    heartCatchupMinDuration: 0.18,
-    heartCatchupMaxDuration: 0.42,
-    heartCatchupEase: "power2.out",
-    heartCatchupRetargetEpsilon: 0.002,
+    heartDeferredMaxSpeed: 1.6,
     morphDuration: 0.5,
     morphEase: "power2.inOut",
     morphPointCount: 128,
@@ -223,9 +220,9 @@
       this.heartJourneyProgress = 0;
       this.heartRenderedProgress = 0;
       this.heartTravelLocked = false;
-      this.heartCatchupTween = null;
-      this.heartCatchupTarget = 0;
-      this.heartCatchupVersion = 0;
+      this.heartDeferredStartScroll = null;
+      this.heartDeferredEndScroll = null;
+      this.heartAwaitingScrollIntent = false;
       this.mapJourneyProgress = 0;
       this.finalPhaseActive = false;
       this.pulseVisible = false;
@@ -286,6 +283,8 @@
         : "red";
 
       this.onScroll = this.onScroll.bind(this);
+      this.onHeartScrollIntent =
+        this.onHeartScrollIntent.bind(this);
       this.onResize = this.onResize.bind(this);
       this.onVisualViewportChange =
         this.onVisualViewportChange.bind(this);
@@ -1744,89 +1743,72 @@
       );
     }
 
-    cancelHeartCatchup({ reset = false } = {}) {
-      this.heartCatchupVersion += 1;
-      this.heartCatchupTween?.kill();
-      this.heartCatchupTween = null;
+    resetDeferredHeartTravel({ resetProgress = true } = {}) {
+      this.heartDeferredStartScroll = null;
+      this.heartDeferredEndScroll = null;
+      this.heartAwaitingScrollIntent = false;
 
-      if (reset) {
+      if (resetProgress) {
         this.heartRenderedProgress = 0;
-        this.heartCatchupTarget = 0;
-      } else {
-        this.heartCatchupTarget = this.heartRenderedProgress;
       }
     }
 
-    startHeartCatchup(targetProgress) {
-      const target = this.clamp01(targetProgress);
-      const distance = Math.abs(target - this.heartRenderedProgress);
+    getDeferredHeartEndScroll(startScroll) {
+      if (!this.journeyGeometry) return startScroll + 1;
 
-      if (
-        this.destroyed ||
-        this.heartTravelLocked ||
-        this.reducedMotionQuery.matches ||
-        document.hidden ||
-        distance <= SETTINGS.heartCatchupRetargetEpsilon
-      ) {
-        this.cancelHeartCatchup();
-        this.heartRenderedProgress = target;
-        this.heartCatchupTarget = target;
-        return false;
+      const fullTravelDistance = Math.max(
+        1,
+        this.journeyGeometry.mapEndScroll -
+          this.journeyGeometry.heartStartScroll
+      );
+      const minimumRemainingDistance =
+        fullTravelDistance / SETTINGS.heartDeferredMaxSpeed;
+
+      return Math.max(
+        this.journeyGeometry.mapEndScroll,
+        startScroll + minimumRemainingDistance
+      );
+    }
+
+    deferHeartTravelUntilNextInput() {
+      if (!this.journeyGeometry) {
+        this.resetDeferredHeartTravel();
+        return;
       }
 
-      const version = ++this.heartCatchupVersion;
-      this.heartCatchupTween?.kill();
-      this.heartCatchupTween = null;
-      this.heartCatchupTarget = target;
+      const startScroll = this.getScrollY();
+      this.heartDeferredStartScroll = startScroll;
+      this.heartDeferredEndScroll =
+        this.getDeferredHeartEndScroll(startScroll);
+      this.heartAwaitingScrollIntent = true;
+      this.heartRenderedProgress = 0;
+      this.heartJourneyProgress = 0;
+    }
 
-      const duration = this.lerp(
-        SETTINGS.heartCatchupMinDuration,
-        SETTINGS.heartCatchupMaxDuration,
-        this.clamp01(distance)
-      );
-      let tween = null;
+    armDeferredHeartTravel() {
+      if (
+        this.destroyed ||
+        this.mode !== "scrolled" ||
+        this.heartTravelLocked ||
+        !this.heartAwaitingScrollIntent ||
+        this.heartDeferredStartScroll === null
+      ) {
+        return;
+      }
 
-      tween = this.gsap.to(this, {
-        heartRenderedProgress: target,
-        duration,
-        ease: SETTINGS.heartCatchupEase,
-        overwrite: false,
-        onUpdate: () => {
-          if (
-            this.destroyed ||
-            version !== this.heartCatchupVersion ||
-            this.heartCatchupTween !== tween
-          ) {
-            return;
-          }
-
-          this.renderJourneyFromScroll({ fromHeartCatchup: true });
-        },
-        onComplete: () => {
-          if (
-            this.destroyed ||
-            version !== this.heartCatchupVersion ||
-            this.heartCatchupTween !== tween
-          ) {
-            return;
-          }
-
-          this.heartCatchupTween = null;
-          this.heartRenderedProgress = target;
-          this.heartCatchupTarget = target;
-          this.renderJourneyFromScroll({ catchUpHeart: true });
-        }
-      });
-      this.heartCatchupTween = tween;
-      return true;
+      /*
+       * Passive wheel/touch events may be delivered after compositor scrolling
+       * has already changed scrollY. Keep the takeover-completion anchor: the
+       * complete next gesture must count, even in asynchronous scrolling.
+       */
+      this.heartAwaitingScrollIntent = false;
+      this.renderJourneyFromScroll();
     }
 
     renderJourneyFromScroll({
       immediate = false,
       forceReset = false,
-      preserveFinalPhase = false,
-      catchUpHeart = false,
-      fromHeartCatchup = false
+      preserveFinalPhase = false
     } = {}) {
       if (
         !this.ready ||
@@ -1856,53 +1838,44 @@
         !forceReset &&
         this.mode === "scrolled" &&
         this.heartTravelLocked;
+      const deferredHeartActive =
+        !forceReset &&
+        this.heartDeferredStartScroll !== null;
+      const deferredHeartWaiting =
+        deferredHeartActive &&
+        this.heartAwaitingScrollIntent;
       let renderedHeartProgress = rawHeartProgress;
 
-      if (forceReset || takeoverLocked) {
-        if (
-          this.heartCatchupTween ||
-          this.heartRenderedProgress > 0.0001
-        ) {
-          this.cancelHeartCatchup({ reset: true });
-        } else {
-          this.heartRenderedProgress = 0;
-          this.heartCatchupTarget = 0;
-        }
+      if (forceReset) {
+        this.resetDeferredHeartTravel();
         renderedHeartProgress = 0;
-      } else if (immediate || this.reducedMotionQuery.matches) {
-        this.cancelHeartCatchup();
+      } else if (takeoverLocked || deferredHeartWaiting) {
+        this.heartRenderedProgress = 0;
+        renderedHeartProgress = 0;
+      } else if (this.reducedMotionQuery.matches) {
+        this.resetDeferredHeartTravel({ resetProgress: false });
         this.heartRenderedProgress = rawHeartProgress;
-        this.heartCatchupTarget = rawHeartProgress;
         renderedHeartProgress = rawHeartProgress;
-      } else if (this.heartCatchupTween) {
-        if (
-          !fromHeartCatchup &&
-          Math.abs(rawHeartProgress - this.heartCatchupTarget) >
-            SETTINGS.heartCatchupRetargetEpsilon
-        ) {
-          this.startHeartCatchup(rawHeartProgress);
-        }
-        renderedHeartProgress = this.heartRenderedProgress;
-      } else if (
-        catchUpHeart &&
-        Math.abs(rawHeartProgress - this.heartRenderedProgress) >
-          SETTINGS.heartCatchupRetargetEpsilon
-      ) {
-        this.startHeartCatchup(rawHeartProgress);
-        renderedHeartProgress = this.heartRenderedProgress;
+      } else if (deferredHeartActive) {
+        renderedHeartProgress = this.getJourneyProgress(
+          scrollY,
+          this.heartDeferredStartScroll,
+          this.heartDeferredEndScroll
+        );
+        this.heartRenderedProgress = renderedHeartProgress;
       } else {
         this.heartRenderedProgress = rawHeartProgress;
-        this.heartCatchupTarget = rawHeartProgress;
         renderedHeartProgress = rawHeartProgress;
       }
 
       const phase2Entered =
         !forceReset &&
         !takeoverLocked &&
+        !deferredHeartWaiting &&
         scrollY >= geometry.phase2StartScroll;
       let finalPhase = false;
 
-      if (takeoverLocked) {
+      if (takeoverLocked || deferredHeartWaiting) {
         this.finalPhaseActive = false;
         this.lastJourneyScrollY = scrollY;
       } else if (preserveFinalPhase) {
@@ -1942,11 +1915,11 @@
       });
 
       /*
-       * The heart remains an authored child of #seq-inactive for the complete
-       * 600 ms takeover. It may follow that logo's entrance transform, but it
-       * must not detach or react to document scroll until the takeover ends.
+       * The heart remains an authored child of #seq-inactive throughout the
+       * 600 ms takeover and the idle period after it. Only a fresh wheel,
+       * touch or keyboard scroll gesture arms the deferred journey.
        */
-      if (takeoverLocked) return;
+      if (takeoverLocked || deferredHeartWaiting) return;
 
       /*
        * Keep rendering the overlay at the scroll-owned source position while
@@ -2032,6 +2005,24 @@
 
     bindEvents() {
       window.addEventListener("scroll", this.onScroll, { passive: true });
+      window.addEventListener("wheel", this.onHeartScrollIntent, {
+        passive: true,
+        capture: true
+      });
+      window.addEventListener("touchstart", this.onHeartScrollIntent, {
+        passive: true,
+        capture: true
+      });
+      window.addEventListener("touchmove", this.onHeartScrollIntent, {
+        passive: true,
+        capture: true
+      });
+      window.addEventListener("keydown", this.onHeartScrollIntent, true);
+      window.addEventListener(
+        "pointerdown",
+        this.onHeartScrollIntent,
+        true
+      );
       window.addEventListener("resize", this.onResize, { passive: true });
       window.visualViewport?.addEventListener(
         "resize",
@@ -2457,9 +2448,10 @@
         /*
          * The inactive wordmark owns the heart until its complete 600 ms
          * entrance has finished. Scroll may advance arbitrarily in the
-         * meantime; the heart catches that absolute position up afterwards.
+         * meantime; that consumed distance becomes the deferred start rather
+         * than triggering movement when the entrance completes.
          */
-        this.cancelHeartCatchup({ reset: true });
+        this.resetDeferredHeartTravel();
         this.heartTravelLocked = true;
         this.heartJourneyProgress = 0;
         this.finalPhaseActive = false;
@@ -2474,7 +2466,7 @@
         }
       } else {
         this.heartTravelLocked = false;
-        this.cancelHeartCatchup({ reset: nextMode === "top" });
+        this.resetDeferredHeartTravel();
       }
 
       if (shouldSetImmediately) {
@@ -2599,7 +2591,8 @@
             this.renderCurrentWord();
             this.stateTimeline = null;
             this.heartTravelLocked = false;
-            this.renderJourneyFromScroll({ catchUpHeart: true });
+            this.deferHeartTravelUntilNextInput();
+            this.renderJourneyFromScroll();
           }
         });
 
@@ -2807,6 +2800,43 @@
       }
     }
 
+    onHeartScrollIntent(event) {
+      if (event.type === "wheel" && Math.abs(event.deltaY) < 0.01) {
+        return;
+      }
+
+      if (event.type === "keydown") {
+        const scrollKeys = new Set([
+          "ArrowDown",
+          "ArrowUp",
+          "PageDown",
+          "PageUp",
+          "Home",
+          "End",
+          " "
+        ]);
+        const target = event.target;
+        const isEditing =
+          target instanceof HTMLElement &&
+          (target.isContentEditable ||
+            /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+
+        if (!scrollKeys.has(event.key) || isEditing) return;
+      }
+
+      if (event.type === "pointerdown") {
+        const scrollbarLeft = document.documentElement.clientWidth;
+        if (
+          event.pointerType !== "mouse" ||
+          event.clientX < scrollbarLeft
+        ) {
+          return;
+        }
+      }
+
+      this.armDeferredHeartTravel();
+    }
+
     onScroll() {
       if (this.scrollFrame || this.destroyed) return;
 
@@ -2878,7 +2908,7 @@
       this.inactiveTimeline = null;
       this.inactiveState = null;
       this.heartTravelLocked = false;
-      this.cancelHeartCatchup({ reset: true });
+      this.resetDeferredHeartTravel();
       this.morphTimeline?.pause();
       this.pulseRunning = false;
       this.pulseTimeline?.pause();
@@ -2888,7 +2918,6 @@
     onVisibilityChange() {
       if (document.hidden) {
         this.stopLoop({ normalize: false });
-        this.cancelHeartCatchup();
         this.morphTimeline?.pause();
         this.stopPulse({ hide: false });
         return;
@@ -2913,7 +2942,7 @@
       this.inactiveTimeline = null;
       this.inactiveState = null;
       this.heartTravelLocked = false;
-      this.cancelHeartCatchup({ reset: true });
+      this.resetDeferredHeartTravel();
       this.finalPhaseActive = false;
       const measured = this.refreshMeasurements();
       this.syncToScroll({ immediate, force: true });
@@ -2951,11 +2980,14 @@
         heartScrollProgress: this.heartScrollProgress,
         heartProgress: this.heartJourneyProgress,
         heartTravelLocked: this.heartTravelLocked,
-        heartCatchupActive: Boolean(
-          this.heartCatchupTween &&
-            this.heartCatchupTween.isActive()
-        ),
-        heartCatchupTarget: this.heartCatchupTarget,
+        heartDeferredActive:
+          this.heartDeferredStartScroll !== null,
+        heartAwaitingScrollIntent:
+          this.heartAwaitingScrollIntent,
+        heartDeferredStartScroll:
+          this.heartDeferredStartScroll,
+        heartDeferredEndScroll:
+          this.heartDeferredEndScroll,
         mapProgress: this.mapJourneyProgress,
         finalPhaseActive: this.finalPhaseActive,
         heartDetached: this.heartDetached,
@@ -2995,7 +3027,7 @@
       this.inactiveTimeline?.kill();
       this.inactiveTimeline = null;
       this.heartTravelLocked = false;
-      this.cancelHeartCatchup({ reset: true });
+      this.resetDeferredHeartTravel();
       this.morphTimeline?.kill();
       this.morphTimeline = null;
       this.pulseTimeline?.kill();
@@ -3010,6 +3042,31 @@
       if (this.pageShowFrame) window.cancelAnimationFrame(this.pageShowFrame);
 
       window.removeEventListener("scroll", this.onScroll);
+      window.removeEventListener(
+        "wheel",
+        this.onHeartScrollIntent,
+        true
+      );
+      window.removeEventListener(
+        "touchstart",
+        this.onHeartScrollIntent,
+        true
+      );
+      window.removeEventListener(
+        "touchmove",
+        this.onHeartScrollIntent,
+        true
+      );
+      window.removeEventListener(
+        "keydown",
+        this.onHeartScrollIntent,
+        true
+      );
+      window.removeEventListener(
+        "pointerdown",
+        this.onHeartScrollIntent,
+        true
+      );
       window.removeEventListener("resize", this.onResize);
       window.visualViewport?.removeEventListener(
         "resize",
