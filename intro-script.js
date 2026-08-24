@@ -58,6 +58,7 @@
     incomingYPercent: 125,
     outgoingRotation: 3,
     incomingRotation: -3,
+    inactiveExitDelayProgress: 0.2,
     finalPhaseExitTolerance: 0,
     scrollDirectionEpsilon: 0.5,
     topEnterTolerance: 1,
@@ -1770,6 +1771,22 @@
       );
     }
 
+    getInactiveExitScroll() {
+      if (!this.journeyGeometry) return 0;
+
+      const exitEndScroll = Math.max(
+        this.journeyGeometry.phase2StartScroll + 1,
+        this.heartDeferredEndScroll ??
+          this.journeyGeometry.mapEndScroll
+      );
+
+      return this.lerp(
+        this.journeyGeometry.phase2StartScroll,
+        exitEndScroll,
+        SETTINGS.inactiveExitDelayProgress
+      );
+    }
+
     deferHeartTravelUntilNextInput() {
       if (!this.journeyGeometry) {
         this.resetDeferredHeartTravel();
@@ -1887,7 +1904,7 @@
         !forceReset &&
         !takeoverLocked &&
         !deferredHeartWaiting &&
-        scrollY >= geometry.phase2StartScroll;
+        scrollY >= this.getInactiveExitScroll();
       let finalPhase = false;
 
       if (takeoverLocked || deferredHeartWaiting) {
@@ -3033,6 +3050,7 @@
               start: this.journeyGeometry.stageStartScroll,
               heartDeparture: this.journeyGeometry.heartStartScroll,
               phase2Entry: this.journeyGeometry.phase2StartScroll,
+              inactiveExit: this.getInactiveExitScroll(),
               heartLanding: this.journeyGeometry.mapEndScroll
             }
           : null
