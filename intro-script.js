@@ -1805,6 +1805,21 @@
       this.renderJourneyFromScroll();
     }
 
+    armDeferredHeartTravelFromScrollDelta() {
+      if (
+        !this.heartAwaitingScrollIntent ||
+        this.heartDeferredStartScroll === null ||
+        Math.abs(
+          this.getScrollY() - this.heartDeferredStartScroll
+        ) <= SETTINGS.scrollDirectionEpsilon
+      ) {
+        return false;
+      }
+
+      this.armDeferredHeartTravel();
+      return true;
+    }
+
     renderJourneyFromScroll({
       immediate = false,
       forceReset = false,
@@ -2838,6 +2853,14 @@
     }
 
     onScroll() {
+      /*
+       * iOS Safari may perform native pan scrolling without delivering the
+       * touch intent event that normally arms the deferred journey. A real
+       * document-scroll delta is an equivalent signal; visualViewport toolbar
+       * events and height-only resizes keep scrollY unchanged and stay inert.
+       */
+      this.armDeferredHeartTravelFromScrollDelta();
+
       if (this.scrollFrame || this.destroyed) return;
 
       this.scrollFrame = window.requestAnimationFrame(() => {
@@ -2849,6 +2872,7 @@
     onVisualViewportChange() {
       if (this.destroyed) return;
 
+      this.armDeferredHeartTravelFromScrollDelta();
       this.visualViewportHeight = this.getVisualViewportHeight();
       this.onResize();
     }
