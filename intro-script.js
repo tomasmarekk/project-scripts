@@ -61,12 +61,13 @@
     topLeaveTolerance: 2,
     assetWaitTimeout: 6000,
     logoSwitchProgress: 0.9,
-    logoSwitchSpan: 0.025,
     morphDuration: 0.5,
     morphEase: "power2.inOut",
     morphPointCount: 128,
     mapStartWidth: 50,
     mapEndWidth: 100,
+    pulseRevealDuration: 0.3,
+    pulseRevealEase: "power2.inOut",
     pulsePeakScale: 1.1053,
     pulseRiseDuration: 0.16,
     pulseFirstFallDuration: 0.12,
@@ -203,14 +204,18 @@
       this.activeYOffset = 0;
       this.wordTimeline = null;
       this.stateTimeline = null;
+      this.journeyLogoTimeline = null;
       this.loopDelay = null;
       this.morphTimeline = null;
       this.pulseTimeline = null;
+      this.pulseRevealTween = null;
       this.morphModel = null;
       this.journeyGeometry = null;
       this.logoJourneyProgress = 0;
+      this.journeyLogoState = null;
       this.heartJourneyProgress = 0;
       this.mapJourneyProgress = 0;
+      this.pulseVisible = false;
       this.heartDetached = false;
       this.heartMarker = null;
       this.heartOverlay = null;
@@ -221,6 +226,7 @@
       this.pageShowFrame = 0;
       this.loopVersion = 0;
       this.stateVersion = 0;
+      this.journeyLogoVersion = 0;
       this.layoutViewportWidth = this.getLayoutViewportWidth();
       this.layoutViewportHeight = this.getViewportHeight();
 
@@ -343,7 +349,7 @@
         }
 
         [${READY_ATTRIBUTE}] #seq-inactive > .l-s-main {
-          will-change: opacity;
+          will-change: opacity, transform;
         }
 
         [${READY_ATTRIBUTE}] .l-s-heart {
@@ -485,12 +491,23 @@
           autoAlpha: 0,
           x: 0,
           y: 0,
+          yPercent: SETTINGS.incomingYPercent,
+          rotation: SETTINGS.incomingRotation,
+          transformOrigin: "0% 50%",
           force3D: true
         });
       }
 
       if (this.journeyReady) {
-        this.gsap.set(this.inactiveLogo, { autoAlpha: 1 });
+        this.gsap.set(this.inactiveLogo, {
+          autoAlpha: 1,
+          x: 0,
+          y: 0,
+          yPercent: 0,
+          rotation: 0,
+          transformOrigin: "0% 50%",
+          force3D: true
+        });
         this.gsap.set(this.movingHeart, {
           x: 0,
           y: 0,
@@ -840,7 +857,7 @@
       }
     }
 
-    startPulse() {
+    startPulse({ immediate = false } = {}) {
       if (
         !this.finalPulse ||
         this.destroyed ||
@@ -850,44 +867,150 @@
         return;
       }
 
-      if (this.reducedMotionQuery.matches) {
-        this.pulseTimeline?.pause(0);
-        this.gsap.set(this.finalPulse, {
-          autoAlpha: 1,
-          scale: 1,
-          transformOrigin: "50% 50%"
-        });
+      const reducedMotion = this.reducedMotionQuery.matches;
+      const shouldShowImmediately = immediate || reducedMotion;
+
+      /*
+       * Scroll continues to emit frames after the final position is reached.
+       * Once the reveal or heartbeat is running, those frames must not reset
+       * either animation. A paused pulse is restarted only after lifecycle
+       * recovery (visibility/page restore).
+       */
+      if (this.pulseVisible && !shouldShowImmediately) {
+        if (
+          this.pulseRevealTween?.isActive() ||
+          this.pulseTimeline?.isActive()
+        ) {
+          return;
+        }
+
+        this.pulseTimeline?.restart();
         return;
       }
 
+      this.pulseVisible = true;
+      this.pulseRevealTween?.kill();
+      this.pulseRevealTween = null;
+
       if (this.pulseTimeline?.isActive()) {
-        return;
+        this.pulseTimeline.pause(0);
+      } else {
+        this.pulseTimeline?.pause();
       }
 
       this.gsap.set(this.finalPulse, {
         autoAlpha: 1,
-        scale: 1,
         transformOrigin: "50% 50%"
       });
-      this.pulseTimeline?.restart();
+
+      if (shouldShowImmediately) {
+        this.gsap.set(this.finalPulse, { scale: 1 });
+
+        if (reducedMotion) {
+          this.pulseTimeline?.pause(0);
+        } else {
+          this.pulseTimeline?.restart();
+        }
+        return;
+      }
+
+      const revealTween = this.gsap.to(this.finalPulse, {
+        scale: 1,
+        duration: SETTINGS.pulseRevealDuration,
+        ease: SETTINGS.pulseRevealEase,
+        onComplete: () => {
+          if (
+            this.destroyed ||
+            this.pulseRevealTween !== revealTween ||
+            !this.pulseVisible
+          ) {
+            return;
+          }
+
+          this.pulseRevealTween = null;
+          if (!this.reducedMotionQuery.matches && !document.hidden) {
+            this.pulseTimeline?.restart();
+          }
+        }
+      });
+      this.pulseRevealTween = revealTween;
     }
 
-    stopPulse({ hide = true } = {}) {
-      this.pulseTimeline?.pause(0);
+    stopPulse({ hide = true, immediate = false } = {}) {
+      if (this.pulseTimeline?.isActive()) {
+        this.pulseTimeline.pause(0);
+      } else {
+        this.pulseTimeline?.pause();
+      }
 
-      if (hide && this.finalPulse) {
+      if (!hide) {
+        this.pulseRevealTween?.pause();
+        return;
+      }
+
+      const shouldHideImmediately =
+        immediate || this.reducedMotionQuery.matches;
+
+      if (!this.pulseVisible) {
+        if (shouldHideImmediately && this.finalPulse) {
+          this.pulseRevealTween?.kill();
+          this.pulseRevealTween = null;
+          this.gsap.set(this.finalPulse, {
+            autoAlpha: 0,
+            scale: 0,
+            transformOrigin: "50% 50%"
+          });
+        }
+        return;
+      }
+
+      this.pulseVisible = false;
+      this.pulseRevealTween?.kill();
+      this.pulseRevealTween = null;
+
+      if (!this.finalPulse) return;
+
+      if (shouldHideImmediately) {
         this.gsap.set(this.finalPulse, {
           autoAlpha: 0,
           scale: 0,
           transformOrigin: "50% 50%"
         });
+        return;
       }
+
+      this.gsap.set(this.finalPulse, {
+        autoAlpha: 1,
+        transformOrigin: "50% 50%"
+      });
+
+      const hideTween = this.gsap.to(this.finalPulse, {
+        scale: 0,
+        duration: SETTINGS.pulseRevealDuration,
+        ease: SETTINGS.pulseRevealEase,
+        onComplete: () => {
+          if (
+            this.destroyed ||
+            this.pulseRevealTween !== hideTween ||
+            this.pulseVisible
+          ) {
+            return;
+          }
+
+          this.pulseRevealTween = null;
+          this.gsap.set(this.finalPulse, {
+            autoAlpha: 0,
+            scale: 0
+          });
+        }
+      });
+      this.pulseRevealTween = hideTween;
     }
 
     requestMorph(finalState, { immediate = false } = {}) {
       if (!this.morphTimeline) {
-        if (finalState) this.startPulse();
-        else this.stopPulse();
+        if (finalState) this.startPulse({ immediate });
+        else this.stopPulse({ immediate });
         return;
       }
 
@@ -900,9 +1023,9 @@
         this.morphTimeline.progress(finalState ? 1 : 0);
 
         if (finalState) {
-          this.startPulse();
+          this.startPulse({ immediate: true });
         } else {
-          this.stopPulse();
+          this.stopPulse({ immediate: true });
           if (this.heartJourneyProgress <= 0.001) {
             this.reattachHeart();
           }
@@ -1266,6 +1389,123 @@
       };
     }
 
+    setJourneyLogoState(
+      nextState,
+      { immediate = false, force = false } = {}
+    ) {
+      if (
+        !this.journeyReady ||
+        !this.inactiveLogo ||
+        !this.finalLogo ||
+        (nextState !== "inactive" && nextState !== "final")
+      ) {
+        return;
+      }
+
+      if (!force && this.journeyLogoState === nextState) return;
+
+      const version = ++this.journeyLogoVersion;
+      this.journeyLogoTimeline?.kill();
+      this.journeyLogoTimeline = null;
+      this.journeyLogoState = nextState;
+
+      const incoming =
+        nextState === "final" ? this.finalLogo : this.inactiveLogo;
+      const outgoing =
+        nextState === "final" ? this.inactiveLogo : this.finalLogo;
+      const shouldSetImmediately =
+        immediate || this.reducedMotionQuery.matches;
+
+      if (shouldSetImmediately) {
+        this.gsap.set(incoming, {
+          autoAlpha: 1,
+          yPercent: 0,
+          rotation: 0,
+          transformOrigin: "0% 50%",
+          force3D: true
+        });
+        this.gsap.set(outgoing, {
+          autoAlpha: 0,
+          yPercent: SETTINGS.outgoingYPercent,
+          rotation: SETTINGS.outgoingRotation,
+          transformOrigin: "100% 50%",
+          force3D: true
+        });
+        return;
+      }
+
+      /*
+       * This is the same Codrops variant-6 choreography used by the
+       * active/inactive takeover: the old logo exits above in 150 ms while
+       * the new logo enters from below with the 600 ms back ease. The heart is
+       * a sibling of inactiveLogo, so it remains independent and can continue
+       * its scroll-owned trip into the map.
+       */
+      this.gsap.set(incoming, {
+        autoAlpha: 0,
+        yPercent: SETTINGS.incomingYPercent,
+        rotation: SETTINGS.incomingRotation,
+        transformOrigin: "0% 50%",
+        force3D: true
+      });
+      this.gsap.set(outgoing, {
+        autoAlpha: 1,
+        transformOrigin: "100% 50%",
+        force3D: true
+      });
+      this.gsap.set([incoming, outgoing], { autoAlpha: 1 });
+
+      this.journeyLogoTimeline = this.gsap.timeline({
+        onComplete: () => {
+          if (
+            this.destroyed ||
+            version !== this.journeyLogoVersion ||
+            this.journeyLogoState !== nextState
+          ) {
+            return;
+          }
+
+          this.gsap.set(outgoing, {
+            autoAlpha: 0,
+            yPercent: SETTINGS.outgoingYPercent,
+            rotation: SETTINGS.outgoingRotation
+          });
+          this.gsap.set(incoming, {
+            autoAlpha: 1,
+            yPercent: 0,
+            rotation: 0
+          });
+          this.journeyLogoTimeline = null;
+        }
+      });
+
+      this.journeyLogoTimeline
+        .to(
+          outgoing,
+          {
+            duration: SETTINGS.outgoingDuration,
+            yPercent: SETTINGS.outgoingYPercent,
+            rotation: SETTINGS.outgoingRotation,
+            transformOrigin: "100% 50%",
+            ease: SETTINGS.outgoingEase,
+            overwrite: true
+          },
+          0
+        )
+        .to(
+          incoming,
+          {
+            duration: SETTINGS.incomingDuration,
+            yPercent: 0,
+            rotation: 0,
+            transformOrigin: "0% 50%",
+            ease: SETTINGS.incomingEase,
+            overwrite: true
+          },
+          0
+        );
+    }
+
     renderJourneyFromScroll({
       immediate = false,
       forceReset = false
@@ -1301,11 +1541,6 @@
             geometry.stageEndScroll,
             geometry.mapEndScroll
           );
-      const switchStart =
-        SETTINGS.logoSwitchProgress - SETTINGS.logoSwitchSpan / 2;
-      const switchProgress = this.clamp01(
-        (logoProgress - switchStart) / SETTINGS.logoSwitchSpan
-      );
 
       this.logoJourneyProgress = logoProgress;
       this.heartJourneyProgress = heartProgress;
@@ -1327,12 +1562,14 @@
         autoRound: false,
         force3D: true
       });
-      this.gsap.set(this.inactiveLogo, {
-        autoAlpha: 1 - switchProgress
-      });
-      this.gsap.set(this.finalLogo, {
-        autoAlpha: switchProgress
-      });
+      this.setJourneyLogoState(
+        logoProgress >= SETTINGS.logoSwitchProgress
+          ? "final"
+          : "inactive",
+        {
+          immediate: immediate || forceReset
+        }
+      );
       this.gsap.set(this.map, {
         width: `${this.lerp(
           SETTINGS.mapStartWidth,
@@ -2232,8 +2469,13 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
+      this.journeyLogoVersion += 1;
+      this.journeyLogoTimeline?.kill();
+      this.journeyLogoTimeline = null;
+      this.journeyLogoState = null;
       this.morphTimeline?.pause();
       this.pulseTimeline?.pause();
+      this.pulseRevealTween?.pause();
     }
 
     onVisibilityChange() {
@@ -2258,6 +2500,10 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
+      this.journeyLogoVersion += 1;
+      this.journeyLogoTimeline?.kill();
+      this.journeyLogoTimeline = null;
+      this.journeyLogoState = null;
       const measured = this.refreshMeasurements();
       this.syncToScroll({ immediate, force: true });
       return measured;
@@ -2286,12 +2532,22 @@
         scrollY: this.getScrollY(),
         journeyReady: this.journeyReady,
         logoProgress: this.logoJourneyProgress,
+        journeyLogoState: this.journeyLogoState,
+        journeyLogoTransitionActive: Boolean(
+          this.journeyLogoTimeline &&
+            this.journeyLogoTimeline.isActive()
+        ),
         heartProgress: this.heartJourneyProgress,
         mapProgress: this.mapJourneyProgress,
         heartDetached: this.heartDetached,
         morphProgress: this.morphTimeline?.progress() || 0,
         pulseActive: Boolean(
           this.pulseTimeline && this.pulseTimeline.isActive()
+        ),
+        pulseVisible: this.pulseVisible,
+        pulseTransitionActive: Boolean(
+          this.pulseRevealTween &&
+            this.pulseRevealTween.isActive()
         ),
         journeyScroll: this.journeyGeometry
           ? {
@@ -2312,10 +2568,15 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
+      this.journeyLogoVersion += 1;
+      this.journeyLogoTimeline?.kill();
+      this.journeyLogoTimeline = null;
       this.morphTimeline?.kill();
       this.morphTimeline = null;
       this.pulseTimeline?.kill();
       this.pulseTimeline = null;
+      this.pulseRevealTween?.kill();
+      this.pulseRevealTween = null;
       this.reattachHeart({ force: true });
 
       if (this.scrollFrame) window.cancelAnimationFrame(this.scrollFrame);
