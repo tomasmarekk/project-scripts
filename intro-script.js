@@ -57,6 +57,11 @@
     incomingYPercent: 125,
     outgoingRotation: 3,
     incomingRotation: -3,
+    journeyExitSafety: 12,
+    stageSmoothingDuration: 0.28,
+    heartSmoothingDuration: 0.22,
+    journeySmoothingEase: "power3.out",
+    finalPhaseExitTolerance: 16,
     topEnterTolerance: 1,
     topLeaveTolerance: 2,
     assetWaitTimeout: 6000,
@@ -205,6 +210,8 @@
       this.wordTimeline = null;
       this.stateTimeline = null;
       this.journeyLogoTimeline = null;
+      this.stagePositionTween = null;
+      this.heartPositionTween = null;
       this.loopDelay = null;
       this.morphTimeline = null;
       this.pulseTimeline = null;
@@ -215,12 +222,12 @@
       this.journeyLogoState = null;
       this.heartJourneyProgress = 0;
       this.mapJourneyProgress = 0;
+      this.finalPhaseActive = false;
       this.pulseVisible = false;
       this.heartDetached = false;
       this.heartMarker = null;
       this.heartOverlay = null;
       this.morphDirection = 0;
-      this.journeyGeometryDirty = false;
       this.scrollFrame = 0;
       this.resizeFrame = 0;
       this.pageShowFrame = 0;
@@ -369,6 +376,9 @@
 
         [${READY_ATTRIBUTE}] .anim-m-last-pulse {
           transform-origin: 50% 50%;
+          -webkit-backface-visibility: hidden;
+          backface-visibility: hidden;
+          transform-style: flat;
           will-change: transform, opacity;
         }
 
@@ -451,7 +461,7 @@
         height: "100%",
         overflow: "visible",
         pointerEvents: "none",
-        zIndex: "4"
+        zIndex: "20"
       });
 
       document.body.appendChild(overlay);
@@ -525,7 +535,7 @@
           autoAlpha: 0,
           scale: 0,
           transformOrigin: "50% 50%",
-          force3D: true
+          force3D: false
         });
 
         this.prepareMorphModel();
@@ -546,6 +556,139 @@
       return value < 0.5
         ? 2 * value * value
         : 1 - Math.pow(-2 * value + 2, 2) / 2;
+    }
+
+    setJourneyPosition(
+      element,
+      x,
+      y,
+      {
+        immediate = false,
+        duration = 0,
+        tweenKey = null
+      } = {}
+    ) {
+      if (!element) return;
+
+      const shouldSetImmediately =
+        immediate ||
+        duration <= 0 ||
+        this.reducedMotionQuery.matches;
+
+      if (tweenKey && this[tweenKey]) {
+        this[tweenKey].kill();
+        this[tweenKey] = null;
+      }
+
+      if (shouldSetImmediately) {
+        this.gsap.set(element, {
+          x,
+          y,
+          autoRound: false,
+          force3D: true
+        });
+        return;
+      }
+
+      const currentX = Number(this.gsap.getProperty(element, "x")) || 0;
+      const currentY = Number(this.gsap.getProperty(element, "y")) || 0;
+      if (
+        Math.abs(currentX - x) < 0.01 &&
+        Math.abs(currentY - y) < 0.01
+      ) {
+        return;
+      }
+
+      const tween = this.gsap.to(element, {
+        x,
+        y,
+        duration,
+        ease: SETTINGS.journeySmoothingEase,
+        overwrite: "auto",
+        autoRound: false,
+        force3D: true,
+        onComplete: () => {
+          if (tweenKey && this[tweenKey] === tween) {
+            this[tweenKey] = null;
+          }
+        }
+      });
+
+      if (tweenKey) this[tweenKey] = tween;
+    }
+
+    getLiveFinalAnchorCenter() {
+      const rect = this.finalAnchor?.getBoundingClientRect();
+      if (!rect) return null;
+
+      return {
+        x: rect.left + rect.width / 2,
+        y: rect.top
+      };
+    }
+
+    getLiveHeartTargetCenter() {
+      const rect = this.shapePlaceholder?.getBoundingClientRect();
+      if (!rect) return null;
+
+      return {
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2
+      };
+    }
+
+    getJourneyOutgoingYPercent(element) {
+      if (!element || !this.stage) return SETTINGS.outgoingYPercent;
+
+      const elementRect = element.getBoundingClientRect();
+      const clipRect = this.stage.getBoundingClientRect();
+      const elementHeight =
+        element.offsetHeight || elementRect.height || 1;
+
+      if (
+        !Number.isFinite(elementRect.bottom) ||
+        !Number.isFinite(clipRect.top) ||
+        !Number.isFinite(elementHeight) ||
+        elementHeight <= 0
+      ) {
+        return SETTINGS.outgoingYPercent;
+      }
+
+      const requiredDistance =
+        elementRect.bottom -
+        clipRect.top +
+        SETTINGS.journeyExitSafety;
+      const requiredPercent =
+        -(Math.max(0, requiredDistance) / elementHeight) * 100;
+
+      return Math.min(SETTINGS.outgoingYPercent, requiredPercent);
+    }
+
+    updateFinalPhase(
+      scrollY,
+      rawHeartProgress,
+      { immediate = false, forceReset = false } = {}
+    ) {
+      if (forceReset) {
+        this.finalPhaseActive = false;
+        return false;
+      }
+
+      if (immediate) {
+        this.finalPhaseActive = rawHeartProgress >= 0.9999;
+        return this.finalPhaseActive;
+      }
+
+      if (this.finalPhaseActive) {
+        this.finalPhaseActive =
+          scrollY >=
+          this.journeyGeometry.mapEndScroll -
+            SETTINGS.finalPhaseExitTolerance;
+      } else if (rawHeartProgress >= 0.9999) {
+        this.finalPhaseActive = true;
+      }
+
+      return this.finalPhaseActive;
     }
 
     readViewBox(svg) {
@@ -729,22 +872,26 @@
         .to(this.finalPulse, {
           scale: SETTINGS.pulsePeakScale,
           duration: SETTINGS.pulseRiseDuration,
-          ease: "sine.inOut"
+          ease: "sine.inOut",
+          force3D: false
         })
         .to(this.finalPulse, {
           scale: 1,
           duration: SETTINGS.pulseFirstFallDuration,
-          ease: "sine.inOut"
+          ease: "sine.inOut",
+          force3D: false
         })
         .to(this.finalPulse, {
           scale: SETTINGS.pulsePeakScale,
           duration: SETTINGS.pulseRiseDuration,
-          ease: "sine.inOut"
+          ease: "sine.inOut",
+          force3D: false
         })
         .to(this.finalPulse, {
           scale: 1,
           duration: SETTINGS.pulseSecondFallDuration,
-          ease: "sine.inOut"
+          ease: "sine.inOut",
+          force3D: false
         });
     }
 
@@ -900,11 +1047,15 @@
 
       this.gsap.set(this.finalPulse, {
         autoAlpha: 1,
-        transformOrigin: "50% 50%"
+        transformOrigin: "50% 50%",
+        force3D: false
       });
 
       if (shouldShowImmediately) {
-        this.gsap.set(this.finalPulse, { scale: 1 });
+        this.gsap.set(this.finalPulse, {
+          scale: 1,
+          force3D: false
+        });
 
         if (reducedMotion) {
           this.pulseTimeline?.pause(0);
@@ -918,6 +1069,7 @@
         scale: 1,
         duration: SETTINGS.pulseRevealDuration,
         ease: SETTINGS.pulseRevealEase,
+        force3D: false,
         onComplete: () => {
           if (
             this.destroyed ||
@@ -958,7 +1110,8 @@
           this.gsap.set(this.finalPulse, {
             autoAlpha: 0,
             scale: 0,
-            transformOrigin: "50% 50%"
+            transformOrigin: "50% 50%",
+            force3D: false
           });
         }
         return;
@@ -974,20 +1127,23 @@
         this.gsap.set(this.finalPulse, {
           autoAlpha: 0,
           scale: 0,
-          transformOrigin: "50% 50%"
+          transformOrigin: "50% 50%",
+          force3D: false
         });
         return;
       }
 
       this.gsap.set(this.finalPulse, {
         autoAlpha: 1,
-        transformOrigin: "50% 50%"
+        transformOrigin: "50% 50%",
+        force3D: false
       });
 
       const hideTween = this.gsap.to(this.finalPulse, {
         scale: 0,
         duration: SETTINGS.pulseRevealDuration,
         ease: SETTINGS.pulseRevealEase,
+        force3D: false,
         onComplete: () => {
           if (
             this.destroyed ||
@@ -1000,7 +1156,8 @@
           this.pulseRevealTween = null;
           this.gsap.set(this.finalPulse, {
             autoAlpha: 0,
-            scale: 0
+            scale: 0,
+            force3D: false
           });
         }
       });
@@ -1120,7 +1277,7 @@
         display: "flex",
         autoAlpha: 1,
         color: this.originalHeartColor,
-        zIndex: 4,
+        zIndex: 20,
         x: markerRect.left,
         y: markerRect.top,
         scaleX: 1,
@@ -1142,6 +1299,15 @@
         !this.originalHeartParent ||
         !this.movingHeart
       ) {
+        return;
+      }
+
+      /*
+       * During the reverse final-logo transition the detached overlay is the
+       * only stacking context that can guarantee the heart stays above
+       * #seq-last. Reattach only after that transition has fully cleared.
+       */
+      if (!force && this.journeyLogoTimeline) {
         return;
       }
 
@@ -1354,7 +1520,6 @@
       }
 
       this.layoutViewportHeight = viewportHeight;
-      this.journeyGeometryDirty = false;
       this.createMorphTimeline();
       return true;
     }
@@ -1383,10 +1548,18 @@
         };
       }
 
-      return {
-        x: geometry.anchorDocumentX - (window.scrollX || 0),
-        y: geometry.anchorDocumentY - scrollY
-      };
+      /*
+       * The authored final anchor can move inside Safari's visual viewport
+       * while its browser chrome expands or collapses. Reading its live
+       * viewport position prevents the completed wordmark from following a
+       * stale document-space snapshot.
+       */
+      return (
+        this.getLiveFinalAnchorCenter() || {
+          x: geometry.anchorDocumentX - (window.scrollX || 0),
+          y: geometry.anchorDocumentY - scrollY
+        }
+      );
     }
 
     setJourneyLogoState(
@@ -1435,6 +1608,20 @@
       }
 
       /*
+       * Keep the heart in the fixed top layer while #seq-last exits. If the
+       * reverse starts before the heart has travelled, detaching it here still
+       * preserves its exact authored marker position.
+       */
+      if (nextState === "inactive") {
+        this.ensureHeartDetached();
+      }
+
+      const outgoingYPercent =
+        nextState === "final"
+          ? this.getJourneyOutgoingYPercent(outgoing)
+          : SETTINGS.outgoingYPercent;
+
+      /*
        * This is the same Codrops variant-6 choreography used by the
        * active/inactive takeover: the old logo exits above in 150 ms while
        * the new logo enters from below with the 600 ms back ease. The heart is
@@ -1467,7 +1654,7 @@
 
           this.gsap.set(outgoing, {
             autoAlpha: 0,
-            yPercent: SETTINGS.outgoingYPercent,
+            yPercent: outgoingYPercent,
             rotation: SETTINGS.outgoingRotation
           });
           this.gsap.set(incoming, {
@@ -1476,6 +1663,15 @@
             rotation: 0
           });
           this.journeyLogoTimeline = null;
+
+          if (
+            nextState === "inactive" &&
+            this.heartJourneyProgress <= 0.001 &&
+            (!this.morphTimeline ||
+              this.morphTimeline.progress() <= 0.001)
+          ) {
+            this.reattachHeart();
+          }
         }
       });
 
@@ -1484,7 +1680,7 @@
           outgoing,
           {
             duration: SETTINGS.outgoingDuration,
-            yPercent: SETTINGS.outgoingYPercent,
+            yPercent: outgoingYPercent,
             rotation: SETTINGS.outgoingRotation,
             transformOrigin: "100% 50%",
             ease: SETTINGS.outgoingEase,
@@ -1527,20 +1723,27 @@
             geometry.stageStartScroll,
             geometry.stageEndScroll
           );
-      const heartProgress = forceReset
+      const rawHeartProgress = forceReset
         ? 0
         : this.getJourneyProgress(
             scrollY,
             geometry.heartStartScroll,
             geometry.mapEndScroll
           );
-      const mapProgress = forceReset
+      const rawMapProgress = forceReset
         ? 0
         : this.getJourneyProgress(
             scrollY,
             geometry.stageEndScroll,
             geometry.mapEndScroll
           );
+      const finalPhase = this.updateFinalPhase(
+        scrollY,
+        rawHeartProgress,
+        { immediate, forceReset }
+      );
+      const heartProgress = finalPhase ? 1 : rawHeartProgress;
+      const mapProgress = finalPhase ? 1 : rawMapProgress;
 
       this.logoJourneyProgress = logoProgress;
       this.heartJourneyProgress = heartProgress;
@@ -1556,12 +1759,16 @@
         y: stickyRect.top + geometry.stageLocalCenter.y
       };
 
-      this.gsap.set(this.stage, {
-        x: stageDesired.x - stageBase.x,
-        y: stageDesired.y - stageBase.y,
-        autoRound: false,
-        force3D: true
-      });
+      this.setJourneyPosition(
+        this.stage,
+        stageDesired.x - stageBase.x,
+        stageDesired.y - stageBase.y,
+        {
+          immediate: immediate || forceReset,
+          duration: SETTINGS.stageSmoothingDuration,
+          tweenKey: "stagePositionTween"
+        }
+      );
       this.setJourneyLogoState(
         logoProgress >= SETTINGS.logoSwitchProgress
           ? "final"
@@ -1621,23 +1828,33 @@
             )
           };
         } else {
-          heartCenter = {
-            x:
-              geometry.targetFinalDocument.centerX -
-              (window.scrollX || 0),
-            y: geometry.targetFinalDocument.centerY - scrollY
-          };
+          heartCenter =
+            this.getLiveHeartTargetCenter() || {
+              x:
+                geometry.targetFinalDocument.centerX -
+                (window.scrollX || 0),
+              y: geometry.targetFinalDocument.centerY - scrollY
+            };
         }
 
-        this.gsap.set(this.movingHeart, {
-          x: heartCenter.x - geometry.heartSourceWidth / 2,
-          y: heartCenter.y - geometry.heartSourceHeight / 2,
-          autoRound: false,
-          force3D: true
-        });
+        this.setJourneyPosition(
+          this.movingHeart,
+          heartCenter.x - geometry.heartSourceWidth / 2,
+          heartCenter.y - geometry.heartSourceHeight / 2,
+          {
+            /*
+             * Once morphed, use the live placeholder as an exact lock rather
+             * than easing toward stale document coordinates. This prevents
+             * iOS toolbar resizes from producing a visible correction hop.
+             */
+            immediate: immediate || forceReset || finalPhase,
+            duration: SETTINGS.heartSmoothingDuration,
+            tweenKey: "heartPositionTween"
+          }
+        );
       }
 
-      if (heartProgress >= 0.9999) {
+      if (finalPhase) {
         this.requestMorph(true, { immediate });
       } else {
         this.requestMorph(false, {
@@ -2134,9 +2351,6 @@
               rotation: 0
             });
             this.stateTimeline = null;
-            if (this.journeyGeometryDirty) {
-              this.refreshJourneyGeometry();
-            }
             this.renderJourneyFromScroll({
               immediate: true,
               forceReset: true
@@ -2195,9 +2409,6 @@
             });
             this.renderCurrentWord();
             this.stateTimeline = null;
-            if (this.journeyGeometryDirty) {
-              this.refreshJourneyGeometry();
-            }
             this.renderJourneyFromScroll();
           }
         });
@@ -2424,10 +2635,13 @@
         /*
          * Mobile Safari emits resize events while its bottom browser bar
          * collapses/expands. Only the viewport height changes, so the vw-based
-         * word geometry is unchanged. Never run the destructive full refresh
-         * during that event: it would kill the active/inactive transition.
-         * The final journey does depend on the visible height, so update only
-         * its anchor geometry once the state transition is not running.
+         * word and morph geometry is unchanged. Keep the scroll thresholds
+         * captured for the current layout width: recomputing them from every
+         * transient visual-viewport height used to push a completed journey
+         * back below its final threshold, reverse the morph, hide the pulse
+         * and then replay everything when Safari settled. The renderer reads
+         * the completed anchors live, so the final heart still stays aligned
+         * without rebuilding the timeline.
          */
         const nextLayoutWidth = this.getLayoutViewportWidth();
         const nextViewportHeight = this.getViewportHeight();
@@ -2437,12 +2651,6 @@
           this.layoutViewportHeight = nextViewportHeight;
 
           if (!this.journeyReady) return;
-          if (this.stateTimeline) {
-            this.journeyGeometryDirty = true;
-            return;
-          }
-
-          this.refreshJourneyGeometry();
           this.renderJourneyFromScroll();
           return;
         }
@@ -2473,6 +2681,8 @@
       this.journeyLogoTimeline?.kill();
       this.journeyLogoTimeline = null;
       this.journeyLogoState = null;
+      this.stagePositionTween?.pause();
+      this.heartPositionTween?.pause();
       this.morphTimeline?.pause();
       this.pulseTimeline?.pause();
       this.pulseRevealTween?.pause();
@@ -2504,6 +2714,11 @@
       this.journeyLogoTimeline?.kill();
       this.journeyLogoTimeline = null;
       this.journeyLogoState = null;
+      this.stagePositionTween?.kill();
+      this.stagePositionTween = null;
+      this.heartPositionTween?.kill();
+      this.heartPositionTween = null;
+      this.finalPhaseActive = false;
       const measured = this.refreshMeasurements();
       this.syncToScroll({ immediate, force: true });
       return measured;
@@ -2539,6 +2754,15 @@
         ),
         heartProgress: this.heartJourneyProgress,
         mapProgress: this.mapJourneyProgress,
+        finalPhaseActive: this.finalPhaseActive,
+        stageSmoothingActive: Boolean(
+          this.stagePositionTween &&
+            this.stagePositionTween.isActive()
+        ),
+        heartSmoothingActive: Boolean(
+          this.heartPositionTween &&
+            this.heartPositionTween.isActive()
+        ),
         heartDetached: this.heartDetached,
         morphProgress: this.morphTimeline?.progress() || 0,
         pulseActive: Boolean(
@@ -2571,6 +2795,10 @@
       this.journeyLogoVersion += 1;
       this.journeyLogoTimeline?.kill();
       this.journeyLogoTimeline = null;
+      this.stagePositionTween?.kill();
+      this.stagePositionTween = null;
+      this.heartPositionTween?.kill();
+      this.heartPositionTween = null;
       this.morphTimeline?.kill();
       this.morphTimeline = null;
       this.pulseTimeline?.kill();
