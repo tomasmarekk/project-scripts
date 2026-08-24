@@ -6,9 +6,11 @@
    *
    * - At the top of the page, the active wordmark loops through its SVG words.
    * - After leaving the top, the active wordmark is replaced by the inactive one.
-   * - Continued scrolling moves the wordmark to its authored final anchor.
-   * - The heart detaches, travels into the expanding map, morphs into the
-   *   Sisslerfeld shape and reveals the final double-beat pulse.
+   * - Continued scrolling detaches the heart from the stationary wordmark and
+   *   moves it into the map.
+   * - When phase two reaches the viewport, the inactive wordmark exits while
+   *   the map expands; the heart then morphs into the Sisslerfeld shape and
+   *   reveals the final double-beat pulse.
    * - Every scroll-owned part is rendered from absolute scroll position, so
    *   reversing, jumping and restoring the page are deterministic.
    *
@@ -30,9 +32,8 @@
     wordWindow: ".logo-seqence-imgs",
     words: ".l-s-sequence-word",
     inactiveLogo: ":scope > .l-s-main",
-    finalLogo: "#seq-last",
     movingHeart: "#moving-heart, .l-s-heart",
-    finalAnchor: ".anim-final-img-location",
+    phase2: ".hero-anim-phase-2",
     mapViewport: ".hero-anim-map-holder",
     map: ".anim-map-holder",
     mapImage: ".anim-map",
@@ -47,7 +48,7 @@
    * staggered group of words, both the outgoing and incoming tween start at 0.
    */
   const SETTINGS = Object.freeze({
-    holdDuration: 1.3,
+    holdDuration: 1,
     outgoingDuration: 0.15,
     incomingDuration: 0.6,
     outgoingEase: "power1.in",
@@ -57,13 +58,14 @@
     incomingYPercent: 125,
     outgoingRotation: 3,
     incomingRotation: -3,
-    journeyExitSafety: 12,
     finalPhaseExitTolerance: 0,
     scrollDirectionEpsilon: 0.5,
     topEnterTolerance: 1,
     topLeaveTolerance: 2,
     assetWaitTimeout: 6000,
-    logoSwitchProgress: 0.9,
+    heartDepartureViewportFraction: 0.12,
+    heartDepartureMinDistance: 64,
+    heartDepartureMaxDistance: 120,
     morphDuration: 0.5,
     morphEase: "power2.inOut",
     morphPointCount: 128,
@@ -96,11 +98,10 @@
       ? Array.from(wordWindow.querySelectorAll(SELECTORS.words))
       : [];
     const inactiveLogo = inactive?.querySelector(SELECTORS.inactiveLogo);
-    const finalLogo = root.querySelector(SELECTORS.finalLogo);
     const movingHeart = inactive?.querySelector(SELECTORS.movingHeart);
     const movingHeartSvg = movingHeart?.querySelector("svg");
     const movingHeartPath = movingHeartSvg?.querySelector("path");
-    const finalAnchor = root.querySelector(SELECTORS.finalAnchor);
+    const phase2 = root.querySelector(SELECTORS.phase2);
     const mapViewport = root.querySelector(SELECTORS.mapViewport);
     const map = mapViewport?.querySelector(SELECTORS.map);
     const mapImage = map?.querySelector(SELECTORS.mapImage);
@@ -126,11 +127,10 @@
 
     const journeyReady = Boolean(
       inactiveLogo &&
-        finalLogo &&
         movingHeart &&
         movingHeartSvg &&
         movingHeartPath &&
-        finalAnchor &&
+        phase2 &&
         mapViewport &&
         map &&
         shapePlaceholder &&
@@ -150,11 +150,10 @@
       wordWindow,
       words,
       inactiveLogo,
-      finalLogo,
       movingHeart,
       movingHeartSvg,
       movingHeartPath,
-      finalAnchor,
+      phase2,
       mapViewport,
       map,
       mapImage,
@@ -179,11 +178,10 @@
       this.wordWindow = elements.wordWindow;
       this.words = elements.words;
       this.inactiveLogo = elements.inactiveLogo;
-      this.finalLogo = elements.finalLogo;
       this.movingHeart = elements.movingHeart;
       this.movingHeartSvg = elements.movingHeartSvg;
       this.movingHeartPath = elements.movingHeartPath;
-      this.finalAnchor = elements.finalAnchor;
+      this.phase2 = elements.phase2;
       this.mapViewport = elements.mapViewport;
       this.map = elements.map;
       this.mapImage = elements.mapImage;
@@ -211,15 +209,15 @@
       this.activeYOffset = 0;
       this.wordTimeline = null;
       this.stateTimeline = null;
-      this.journeyLogoTimeline = null;
+      this.inactiveTimeline = null;
       this.loopDelay = null;
       this.morphTimeline = null;
       this.pulseTimeline = null;
       this.pulseRevealTween = null;
       this.morphModel = null;
       this.journeyGeometry = null;
-      this.logoJourneyProgress = 0;
-      this.journeyLogoState = null;
+      this.phase2Progress = 0;
+      this.inactiveState = null;
       this.heartJourneyProgress = 0;
       this.mapJourneyProgress = 0;
       this.finalPhaseActive = false;
@@ -236,7 +234,7 @@
       this.pageShowFrame = 0;
       this.loopVersion = 0;
       this.stateVersion = 0;
-      this.journeyLogoVersion = 0;
+      this.inactiveVersion = 0;
       this.layoutViewportWidth = this.getLayoutViewportWidth();
       this.layoutViewportHeight = this.getLayoutViewportHeight();
       this.visualViewportHeight = this.getVisualViewportHeight();
@@ -254,7 +252,6 @@
         this.wordWindow,
         ...this.words,
         this.inactiveLogo,
-        this.finalLogo,
         this.movingHeart,
         this.movingHeartSvg,
         this.movingHeartPath,
@@ -297,7 +294,7 @@
 
       if (!this.journeyReady) {
         console.warn(
-          "[Sisslerfeld hero] Final animation elements were not found; the intro will keep its phase-one behavior."
+          "[Sisslerfeld hero] Heart/map animation elements were not found; the intro will keep its phase-one behavior."
         );
       }
 
@@ -316,13 +313,10 @@
       style.id = STYLE_ID;
       style.textContent = `
         [${READY_ATTRIBUTE}] .logo-main-holder {
-          width: 100% !important;
-          max-width: none !important;
           display: grid !important;
           grid-template-columns: minmax(0, 1fr) !important;
           grid-template-rows: minmax(0, 1fr) !important;
           place-items: center !important;
-          will-change: transform;
         }
 
         [${READY_ATTRIBUTE}] #seq-active,
@@ -347,19 +341,6 @@
         [${READY_ATTRIBUTE}] .logo-w-h-wrap {
           display: flex !important;
           position: relative !important;
-        }
-
-        [${READY_ATTRIBUTE}] #seq-last,
-        [${READY_ATTRIBUTE}] .l-s-last {
-          grid-area: 1 / 1 !important;
-          align-self: center !important;
-          justify-self: center !important;
-          display: block !important;
-          margin: 0 !important;
-          flex: none !important;
-          pointer-events: none;
-          backface-visibility: hidden;
-          will-change: opacity, transform;
         }
 
         [${READY_ATTRIBUTE}] #seq-inactive > .l-s-main {
@@ -507,23 +488,6 @@
         force3D: true
       });
 
-      /*
-       * Runtime CSS makes the optional final wordmark measurable. Keep it
-       * hidden even when another journey node is missing and phase one is the
-       * only available fallback; the journey renderer is its sole revealer.
-       */
-      if (this.finalLogo) {
-        this.gsap.set(this.finalLogo, {
-          autoAlpha: 0,
-          x: 0,
-          y: 0,
-          yPercent: SETTINGS.incomingYPercent,
-          rotation: SETTINGS.incomingRotation,
-          transformOrigin: "0% 50%",
-          force3D: true
-        });
-      }
-
       if (this.journeyReady) {
         this.gsap.set(this.inactiveLogo, {
           autoAlpha: 1,
@@ -579,16 +543,6 @@
         : 1 - Math.pow(-2 * value + 2, 2) / 2;
     }
 
-    getLiveFinalAnchorCenter() {
-      const rect = this.finalAnchor?.getBoundingClientRect();
-      if (!rect) return null;
-
-      return {
-        x: rect.left + rect.width / 2,
-        y: rect.top
-      };
-    }
-
     getLiveHeartTargetCenter() {
       const rect = this.shapePlaceholder?.getBoundingClientRect();
       if (!rect) return null;
@@ -597,33 +551,6 @@
         x: rect.left + rect.width / 2,
         y: rect.top + rect.height / 2
       };
-    }
-
-    getJourneyOutgoingYPercent(element) {
-      if (!element || !this.stage) return SETTINGS.outgoingYPercent;
-
-      const elementRect = element.getBoundingClientRect();
-      const clipRect = this.stage.getBoundingClientRect();
-      const elementHeight =
-        element.offsetHeight || elementRect.height || 1;
-
-      if (
-        !Number.isFinite(elementRect.bottom) ||
-        !Number.isFinite(clipRect.top) ||
-        !Number.isFinite(elementHeight) ||
-        elementHeight <= 0
-      ) {
-        return SETTINGS.outgoingYPercent;
-      }
-
-      const requiredDistance =
-        elementRect.bottom -
-        clipRect.top +
-        SETTINGS.journeyExitSafety;
-      const requiredPercent =
-        -(Math.max(0, requiredDistance) / elementHeight) * 100;
-
-      return Math.min(SETTINGS.outgoingYPercent, requiredPercent);
     }
 
     updateFinalPhase(
@@ -1448,15 +1375,15 @@
       }
 
       /*
-       * During the reverse final-logo transition the detached overlay is the
-       * only stacking context that can guarantee the heart stays above
-       * #seq-last. Reattach only after that transition has fully cleared.
+       * While the phase-two wordmark transition is running, the overlay keeps
+       * the heart independent from the clipping logo stage. Reattach only after
+       * the inactive logo is fully restored.
        */
-      if (!force && this.journeyLogoTimeline) {
+      if (!force && this.inactiveTimeline) {
         return;
       }
 
-      if (!force && this.journeyLogoState !== "inactive") {
+      if (!force && this.inactiveState !== "visible") {
         return;
       }
 
@@ -1526,7 +1453,7 @@
         !this.journeyReady ||
         !this.heartMarker ||
         !this.map ||
-        !this.finalAnchor
+        !this.phase2
       ) {
         return false;
       }
@@ -1559,12 +1486,10 @@
         return false;
       }
 
-      const anchorRect = this.finalAnchor.getBoundingClientRect();
+      const phase2Rect = this.phase2.getBoundingClientRect();
       const mapViewportRect = this.mapViewport.getBoundingClientRect();
       const rootRect = this.root.getBoundingClientRect();
-      const anchorDocumentX = anchorRect.left + scrollX;
-      const anchorDocumentY = anchorRect.top + scrollY;
-      const mapDocumentTop = mapViewportRect.top + scrollY;
+      const phase2DocumentTop = phase2Rect.top + scrollY;
       const mapDocumentBottom = mapViewportRect.bottom + scrollY;
       const rootDocumentTop = rootRect.top + scrollY;
 
@@ -1604,21 +1529,28 @@
         0,
         rootDocumentTop + SETTINGS.topLeaveTolerance
       );
-      const stageEndScroll = Math.max(
+      const phase2StartScroll = Math.max(
         stageStartScroll + 1,
-        mapDocumentTop - viewportHeight
+        phase2DocumentTop - viewportHeight
       );
-      const heartStartScroll = this.lerp(
-        stageStartScroll,
-        stageEndScroll,
-        SETTINGS.logoSwitchProgress
+      const heartDepartureDistance = Math.min(
+        SETTINGS.heartDepartureMaxDistance,
+        Math.max(
+          SETTINGS.heartDepartureMinDistance,
+          viewportHeight * SETTINGS.heartDepartureViewportFraction
+        )
+      );
+      const heartStartScroll = Math.min(
+        phase2StartScroll,
+        stageStartScroll + heartDepartureDistance
       );
       const mapEndScroll = Math.max(
-        stageEndScroll + 1,
+        phase2StartScroll + 1,
         mapDocumentBottom - viewportHeight
       );
       const stickyTop =
         this.readPixelValue(window.getComputedStyle(this.sticky).top) || 0;
+      const stickyRect = this.sticky.getBoundingClientRect();
       const stageLocalCenter = {
         x: stageOffset.x + stageWidth / 2,
         y: stageOffset.y + stageHeight / 2
@@ -1632,48 +1564,28 @@
         y: heartOffset.y + heartSourceHeight / 2
       };
       const stageStartCenter = {
-        x: stageLocalCenter.x,
+        x: stickyRect.left + stageLocalCenter.x,
         y: stickyTop + stageLocalCenter.y
-      };
-      const stageLandingCenter = {
-        x: anchorDocumentX + anchorRect.width / 2 - scrollX,
-        y: anchorDocumentY - stageEndScroll
-      };
-      const stageAtHeartStart = {
-        x: this.lerp(
-          stageStartCenter.x,
-          stageLandingCenter.x,
-          this.easeInOut(SETTINGS.logoSwitchProgress)
-        ),
-        y: this.lerp(
-          stageStartCenter.y,
-          stageLandingCenter.y,
-          this.easeInOut(SETTINGS.logoSwitchProgress)
-        )
       };
       const heartStartCenter = {
         x:
-          stageAtHeartStart.x +
+          stageStartCenter.x +
           (heartLocalCenter.x - stageElementCenter.x),
         y:
-          stageAtHeartStart.y +
+          stageStartCenter.y +
           (heartLocalCenter.y - stageElementCenter.y)
       };
 
       this.journeyGeometry = {
         viewportHeight,
         stageStartScroll,
-        stageEndScroll,
+        phase2StartScroll,
         heartStartScroll,
         mapEndScroll,
         stageLocalCenter,
         stageElementCenter,
         heartLocalCenter,
         stageStartCenter,
-        stageLandingCenter,
-        anchorDocumentX:
-          anchorDocumentX + anchorRect.width / 2,
-        anchorDocumentY,
         heartStartCenter,
         heartEndCenter: {
           x: targetFinalDocument.centerX - scrollX,
@@ -1710,144 +1622,99 @@
       return this.clamp01((scrollY - start) / Math.max(1, end - start));
     }
 
-    getStageDesiredCenter(scrollY, logoProgress) {
-      const geometry = this.journeyGeometry;
-      if (!geometry) return { x: 0, y: 0 };
-
-      if (logoProgress < 1) {
-        const eased = this.easeInOut(logoProgress);
-        return {
-          x: this.lerp(
-            geometry.stageStartCenter.x,
-            geometry.stageLandingCenter.x,
-            eased
-          ),
-          y: this.lerp(
-            geometry.stageStartCenter.y,
-            geometry.stageLandingCenter.y,
-            eased
-          )
-        };
-      }
-
-      /*
-       * The authored final anchor can move inside Safari's visual viewport
-       * while its browser chrome expands or collapses. Reading its live
-       * viewport position prevents the completed wordmark from following a
-       * stale document-space snapshot.
-       */
-      return (
-        this.getLiveFinalAnchorCenter() || {
-          x: geometry.anchorDocumentX - (window.scrollX || 0),
-          y: geometry.anchorDocumentY - scrollY
-        }
-      );
-    }
-
-    setJourneyLogoState(
+    setInactiveJourneyState(
       nextState,
       { immediate = false, force = false } = {}
     ) {
       if (
         !this.journeyReady ||
         !this.inactiveLogo ||
-        !this.finalLogo ||
-        (nextState !== "inactive" && nextState !== "final")
+        (nextState !== "visible" && nextState !== "hidden")
       ) {
         return;
       }
 
-      if (!force && this.journeyLogoState === nextState) return;
+      if (!force && this.inactiveState === nextState) return;
 
-      const version = ++this.journeyLogoVersion;
-      this.journeyLogoTimeline?.kill();
-      this.journeyLogoTimeline = null;
-      this.journeyLogoState = nextState;
+      const version = ++this.inactiveVersion;
+      this.inactiveTimeline?.kill();
+      this.inactiveTimeline = null;
+      this.inactiveState = nextState;
 
-      const incoming =
-        nextState === "final" ? this.finalLogo : this.inactiveLogo;
-      const outgoing =
-        nextState === "final" ? this.inactiveLogo : this.finalLogo;
       const shouldSetImmediately =
         immediate || this.reducedMotionQuery.matches;
 
       if (shouldSetImmediately) {
-        this.gsap.set(incoming, {
-          autoAlpha: 1,
-          yPercent: 0,
-          rotation: 0,
-          transformOrigin: "0% 50%",
+        this.gsap.set(this.inactiveLogo, {
+          autoAlpha: nextState === "visible" ? 1 : 0,
+          yPercent:
+            nextState === "visible" ? 0 : SETTINGS.outgoingYPercent,
+          rotation:
+            nextState === "visible" ? 0 : SETTINGS.outgoingRotation,
+          transformOrigin:
+            nextState === "visible" ? "0% 50%" : "100% 50%",
           force3D: true
         });
-        this.gsap.set(outgoing, {
-          autoAlpha: 0,
-          yPercent: SETTINGS.outgoingYPercent,
-          rotation: SETTINGS.outgoingRotation,
-          transformOrigin: "100% 50%",
-          force3D: true
-        });
+        if (this.mode === "scrolled") {
+          this.gsap.set(this.inactive, {
+            autoAlpha: nextState === "visible" ? 1 : 0
+          });
+        }
         return;
       }
 
       /*
-       * Keep the heart in the fixed top layer while #seq-last exits. If the
-       * reverse starts before the heart has travelled, detaching it here still
-       * preserves its exact authored marker position.
+       * At phase two the wordmark and travelling heart become independent.
+       * The invisible marker preserves the exact authored source geometry for
+       * deterministic reverse scrolling and responsive rebuilds.
        */
-      if (nextState === "inactive") {
+      if (nextState === "hidden") {
         this.ensureHeartDetached();
+      } else if (this.mode === "scrolled") {
+        this.gsap.set(this.inactive, { autoAlpha: 1 });
       }
 
-      const outgoingYPercent =
-        nextState === "final"
-          ? this.getJourneyOutgoingYPercent(outgoing)
-          : SETTINGS.outgoingYPercent;
-
       /*
-       * This is the same Codrops variant-6 choreography used by the
-       * active/inactive takeover: the old logo exits above in 150 ms while
-       * the new logo enters from below with the 600 ms back ease. The heart is
-       * a sibling of inactiveLogo, so it remains independent and can continue
-       * its scroll-owned trip into the map.
+       * The phase-two boundary reuses the directional halves of Codrops
+       * variant 6: 150 ms above on the way down, 600 ms from below with the
+       * same back ease on reverse. The heart is a sibling of inactiveLogo, so
+       * it keeps following the scroll-owned path independently.
        */
-      this.gsap.set(incoming, {
-        autoAlpha: 0,
-        yPercent: SETTINGS.incomingYPercent,
-        rotation: SETTINGS.incomingRotation,
-        transformOrigin: "0% 50%",
-        force3D: true
-      });
-      this.gsap.set(outgoing, {
+      this.gsap.set(this.inactiveLogo, {
         autoAlpha: 1,
-        transformOrigin: "100% 50%",
+        yPercent:
+          nextState === "hidden" ? 0 : SETTINGS.incomingYPercent,
+        rotation:
+          nextState === "hidden" ? 0 : SETTINGS.incomingRotation,
+        transformOrigin:
+          nextState === "hidden" ? "100% 50%" : "0% 50%",
         force3D: true
       });
-      this.gsap.set([incoming, outgoing], { autoAlpha: 1 });
 
-      this.journeyLogoTimeline = this.gsap.timeline({
+      this.inactiveTimeline = this.gsap.timeline({
         onComplete: () => {
           if (
             this.destroyed ||
-            version !== this.journeyLogoVersion ||
-            this.journeyLogoState !== nextState
+            version !== this.inactiveVersion ||
+            this.inactiveState !== nextState
           ) {
             return;
           }
 
-          this.gsap.set(outgoing, {
-            autoAlpha: 0,
-            yPercent: outgoingYPercent,
-            rotation: SETTINGS.outgoingRotation
+          this.gsap.set(this.inactiveLogo, {
+            autoAlpha: nextState === "visible" ? 1 : 0,
+            yPercent:
+              nextState === "visible" ? 0 : SETTINGS.outgoingYPercent,
+            rotation:
+              nextState === "visible" ? 0 : SETTINGS.outgoingRotation
           });
-          this.gsap.set(incoming, {
-            autoAlpha: 1,
-            yPercent: 0,
-            rotation: 0
-          });
-          this.journeyLogoTimeline = null;
+          if (nextState === "hidden" && this.mode === "scrolled") {
+            this.gsap.set(this.inactive, { autoAlpha: 0 });
+          }
+          this.inactiveTimeline = null;
 
           if (
-            nextState === "inactive" &&
+            nextState === "visible" &&
             this.heartJourneyProgress <= 0.001 &&
             (!this.morphTimeline ||
               this.morphTimeline.progress() <= 0.001)
@@ -1857,22 +1724,18 @@
         }
       });
 
-      this.journeyLogoTimeline
-        .to(
-          outgoing,
-          {
+      this.inactiveTimeline.to(
+        this.inactiveLogo,
+        nextState === "hidden"
+          ? {
             duration: SETTINGS.outgoingDuration,
-            yPercent: outgoingYPercent,
+            yPercent: SETTINGS.outgoingYPercent,
             rotation: SETTINGS.outgoingRotation,
             transformOrigin: "100% 50%",
             ease: SETTINGS.outgoingEase,
             overwrite: true
-          },
-          0
-        )
-        .to(
-          incoming,
-          {
+          }
+          : {
             duration: SETTINGS.incomingDuration,
             yPercent: 0,
             rotation: 0,
@@ -1880,8 +1743,8 @@
             ease: SETTINGS.incomingEase,
             overwrite: true
           },
-          0
-        );
+        0
+      );
     }
 
     renderJourneyFromScroll({
@@ -1899,13 +1762,6 @@
 
       const geometry = this.journeyGeometry;
       const scrollY = forceReset ? geometry.stageStartScroll : this.getScrollY();
-      const logoProgress = forceReset
-        ? 0
-        : this.getJourneyProgress(
-            scrollY,
-            geometry.stageStartScroll,
-            geometry.stageEndScroll
-          );
       const rawHeartProgress = forceReset
         ? 0
         : this.getJourneyProgress(
@@ -1917,9 +1773,11 @@
         ? 0
         : this.getJourneyProgress(
             scrollY,
-            geometry.stageEndScroll,
+            geometry.phase2StartScroll,
             geometry.mapEndScroll
           );
+      const phase2Entered =
+        !forceReset && scrollY >= geometry.phase2StartScroll;
       const finalPhase = preserveFinalPhase
         ? this.finalPhaseActive
         : this.updateFinalPhase(scrollY, rawHeartProgress, {
@@ -1929,30 +1787,12 @@
       const heartProgress = finalPhase ? 1 : rawHeartProgress;
       const mapProgress = finalPhase ? 1 : rawMapProgress;
 
-      this.logoJourneyProgress = logoProgress;
+      this.phase2Progress = rawMapProgress;
       this.heartJourneyProgress = heartProgress;
       this.mapJourneyProgress = mapProgress;
 
-      const stageDesired = this.getStageDesiredCenter(
-        scrollY,
-        logoProgress
-      );
-      const stickyRect = this.sticky.getBoundingClientRect();
-      const stageBase = {
-        x: stickyRect.left + geometry.stageLocalCenter.x,
-        y: stickyRect.top + geometry.stageLocalCenter.y
-      };
-
-      this.gsap.set(this.stage, {
-        x: stageDesired.x - stageBase.x,
-        y: stageDesired.y - stageBase.y,
-        autoRound: false,
-        force3D: true
-      });
-      this.setJourneyLogoState(
-        logoProgress >= SETTINGS.logoSwitchProgress
-          ? "final"
-          : "inactive",
+      this.setInactiveJourneyState(
+        phase2Entered ? "hidden" : "visible",
         {
           immediate: immediate || forceReset
         }
@@ -1985,17 +1825,23 @@
 
         if (heartProgress <= 0.0001) {
           /*
-           * Derive the source from the same absolute stage target used above.
-           * No asynchronous transform is allowed to leave the overlay heart
-           * behind its responsive marker.
+           * Derive the source from the stationary authored stage. Offset-based
+           * geometry deliberately ignores the active/inactive transition
+           * transforms, so a large reverse jump cannot strand the overlay
+           * heart below the clipping window.
            */
+          const stickyRect = this.sticky.getBoundingClientRect();
+          const stageCenter = {
+            x: stickyRect.left + geometry.stageLocalCenter.x,
+            y: stickyRect.top + geometry.stageLocalCenter.y
+          };
           heartCenter = {
             x:
-              stageDesired.x +
+              stageCenter.x +
               (geometry.heartLocalCenter.x -
                 geometry.stageElementCenter.x),
             y:
-              stageDesired.y +
+              stageCenter.y +
               (geometry.heartLocalCenter.y -
                 geometry.stageElementCenter.y)
           };
@@ -2078,8 +1924,7 @@
       const images = [
         this.leadingLogo,
         ...this.words,
-        this.inactiveLogo,
-        this.finalLogo
+        this.inactiveLogo
       ].filter((image) => image?.tagName === "IMG");
       const journeyImages = [this.mapImage].filter(
         (image) => image?.tagName === "IMG"
@@ -2861,10 +2706,10 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
-      this.journeyLogoVersion += 1;
-      this.journeyLogoTimeline?.kill();
-      this.journeyLogoTimeline = null;
-      this.journeyLogoState = null;
+      this.inactiveVersion += 1;
+      this.inactiveTimeline?.kill();
+      this.inactiveTimeline = null;
+      this.inactiveState = null;
       this.morphTimeline?.pause();
       this.pulseRunning = false;
       this.pulseTimeline?.pause();
@@ -2893,10 +2738,10 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
-      this.journeyLogoVersion += 1;
-      this.journeyLogoTimeline?.kill();
-      this.journeyLogoTimeline = null;
-      this.journeyLogoState = null;
+      this.inactiveVersion += 1;
+      this.inactiveTimeline?.kill();
+      this.inactiveTimeline = null;
+      this.inactiveState = null;
       this.finalPhaseActive = false;
       const measured = this.refreshMeasurements();
       this.syncToScroll({ immediate, force: true });
@@ -2925,11 +2770,11 @@
         reducedMotion: this.reducedMotionQuery.matches,
         scrollY: this.getScrollY(),
         journeyReady: this.journeyReady,
-        logoProgress: this.logoJourneyProgress,
-        journeyLogoState: this.journeyLogoState,
-        journeyLogoTransitionActive: Boolean(
-          this.journeyLogoTimeline &&
-            this.journeyLogoTimeline.isActive()
+        phase2Progress: this.phase2Progress,
+        inactiveState: this.inactiveState,
+        inactiveTransitionActive: Boolean(
+          this.inactiveTimeline &&
+            this.inactiveTimeline.isActive()
         ),
         heartProgress: this.heartJourneyProgress,
         mapProgress: this.mapJourneyProgress,
@@ -2951,8 +2796,8 @@
         journeyScroll: this.journeyGeometry
           ? {
               start: this.journeyGeometry.stageStartScroll,
-              logoLanding: this.journeyGeometry.stageEndScroll,
               heartDeparture: this.journeyGeometry.heartStartScroll,
+              phase2Entry: this.journeyGeometry.phase2StartScroll,
               heartLanding: this.journeyGeometry.mapEndScroll
             }
           : null
@@ -2967,9 +2812,9 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
-      this.journeyLogoVersion += 1;
-      this.journeyLogoTimeline?.kill();
-      this.journeyLogoTimeline = null;
+      this.inactiveVersion += 1;
+      this.inactiveTimeline?.kill();
+      this.inactiveTimeline = null;
       this.morphTimeline?.kill();
       this.morphTimeline = null;
       this.pulseTimeline?.kill();
