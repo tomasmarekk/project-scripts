@@ -2096,6 +2096,54 @@
       return true;
     }
 
+    settleSkippedJourneyAtEnd(scrollY) {
+      const pendingTakeover =
+        this.heartTravelLocked ||
+        this.heartDeferredStartScroll !== null;
+
+      if (
+        !pendingTakeover ||
+        this.mode !== "scrolled" ||
+        !this.journeyGeometry ||
+        scrollY <
+          this.journeyGeometry.mapEndScroll -
+            SETTINGS.scrollDirectionEpsilon
+      ) {
+        return false;
+      }
+
+      /*
+       * A fast inertial scroll or an in-page anchor can cross the complete
+       * journey while the 600 ms wordmark takeover still owns the heart. The
+       * deferred journey must not then start below its own destination: that
+       * would leave the authored source heart visible in the viewport until a
+       * later gesture. Cancel the stale takeover and normalize its holders now;
+       * the current render can dock the heart to the target in the same frame.
+       */
+      this.stateVersion += 1;
+      this.stateTimeline?.kill();
+      this.stateTimeline = null;
+      this.heartTravelLocked = false;
+      this.resetDeferredHeartTravel({ resetProgress: false });
+      this.finalPhaseActive = true;
+      this.lastJourneyScrollY = scrollY;
+
+      this.gsap.set(this.active, {
+        autoAlpha: 0,
+        yPercent: SETTINGS.outgoingYPercent,
+        rotation: SETTINGS.outgoingRotation,
+        transformOrigin: "100% 50%"
+      });
+      this.gsap.set(this.inactive, {
+        autoAlpha: 1,
+        yPercent: 0,
+        rotation: 0,
+        transformOrigin: "0% 50%"
+      });
+
+      return true;
+    }
+
     renderJourneyFromScroll({
       immediate = false,
       forceReset = false,
@@ -2125,6 +2173,10 @@
             geometry.phase2StartScroll,
             geometry.mapEndScroll
           );
+      const skippedJourneyAtEnd =
+        !forceReset &&
+        rawHeartProgress >= 0.9999 &&
+        this.settleSkippedJourneyAtEnd(scrollY);
       const takeoverLocked =
         !forceReset &&
         this.mode === "scrolled" &&
@@ -2164,7 +2216,7 @@
       if (takeoverLocked || deferredHeartWaiting) {
         this.finalPhaseActive = false;
         this.lastJourneyScrollY = scrollY;
-      } else if (preserveFinalPhase) {
+      } else if (preserveFinalPhase && !skippedJourneyAtEnd) {
         finalPhase = this.finalPhaseActive;
       } else {
         finalPhase = this.updateFinalPhase(
