@@ -8,9 +8,9 @@
    * - After leaving the top, the active wordmark is replaced by the inactive one.
    * - Continued scrolling detaches the heart from the stationary wordmark and
    *   moves it into the map.
-   * - When phase two reaches the viewport, the inactive wordmark exits while
-   *   the map expands; the heart then morphs into the Sisslerfeld shape and
-   *   reveals the final double-beat pulse.
+   * - As the heart starts travelling, the stationary wordmark fades until the
+   *   heart has cleared it; the map then expands, the heart morphs into the
+   *   Sisslerfeld shape and reveals the final double-beat pulse.
    * - Every scroll-owned part is rendered from absolute scroll position, so
    *   reversing, jumping and restoring the page are deterministic.
    *
@@ -58,13 +58,15 @@
     incomingYPercent: 125,
     outgoingRotation: 3,
     incomingRotation: -3,
-    inactiveExitDelayProgress: 0.4,
     finalPhaseExitTolerance: 0,
     scrollDirectionEpsilon: 0.5,
     topEnterTolerance: 1,
     topLeaveTolerance: 2,
     assetWaitTimeout: 6000,
     heartDeferredMaxSpeed: 1.6,
+    heartPathDepthViewport: 0.26,
+    heartPathMaxDepth: 240,
+    heartPathSecondControlX: 0.4,
     morphDuration: 0.5,
     morphEase: "power2.inOut",
     morphPointCount: 128,
@@ -208,7 +210,6 @@
       this.activeYOffset = 0;
       this.wordTimeline = null;
       this.stateTimeline = null;
-      this.inactiveTimeline = null;
       this.loopDelay = null;
       this.morphTimeline = null;
       this.pulseTimeline = null;
@@ -217,6 +218,8 @@
       this.journeyGeometry = null;
       this.phase2Progress = 0;
       this.inactiveState = null;
+      this.wordmarkFadeProgress = 0;
+      this.wordmarkOpacity = 1;
       this.heartScrollProgress = 0;
       this.heartJourneyProgress = 0;
       this.heartRenderedProgress = 0;
@@ -228,6 +231,7 @@
       this.finalPhaseActive = false;
       this.pulseVisible = false;
       this.pulseRunning = false;
+      this.pulseDetached = false;
       this.heartDetached = false;
       this.heartDocked = false;
       this.heartMarker = null;
@@ -239,7 +243,6 @@
       this.pageShowFrame = 0;
       this.loopVersion = 0;
       this.stateVersion = 0;
-      this.inactiveVersion = 0;
       this.layoutViewportWidth = this.getLayoutViewportWidth();
       this.layoutViewportHeight = this.getLayoutViewportHeight();
       this.visualViewportHeight = this.getVisualViewportHeight();
@@ -279,6 +282,9 @@
         this.movingHeart?.nextSibling || null;
       this.originalHeartPathD =
         this.movingHeartPath?.getAttribute("d") || "";
+      this.originalPulseParent = this.finalPulse?.parentNode || null;
+      this.originalPulseNextSibling =
+        this.finalPulse?.nextSibling || null;
       this.originalHeartColor = this.movingHeart
         ? window.getComputedStyle(this.movingHeart).color
         : "red";
@@ -374,12 +380,14 @@
           position: relative !important;
         }
 
-        [${READY_ATTRIBUTE}] .anim-m-last-pulse {
+        [${READY_ATTRIBUTE}] .anim-m-last-pulse,
+        [data-sisslerfeld-heart-overlay] .anim-m-last-pulse {
           transform-origin: 50% 50%;
           will-change: transform, opacity;
         }
 
-        [${READY_ATTRIBUTE}] .anim-m-last-pulse > svg {
+        [${READY_ATTRIBUTE}] .anim-m-last-pulse > svg,
+        [data-sisslerfeld-heart-overlay] .anim-m-last-pulse > svg {
           transform-origin: 50% 50%;
           transform-box: fill-box;
           will-change: transform;
@@ -543,11 +551,209 @@
       return start + (end - start) * progress;
     }
 
-    easeInOut(progress) {
-      const value = this.clamp01(progress);
-      return value < 0.5
-        ? 2 * value * value
-        : 1 - Math.pow(-2 * value + 2, 2) / 2;
+    cubicBezierPoint(start, control1, control2, end, progress) {
+      const t = this.clamp01(progress);
+      const inverse = 1 - t;
+      const inverseSquared = inverse * inverse;
+      const squared = t * t;
+
+      return {
+        x:
+          inverseSquared * inverse * start.x +
+          3 * inverseSquared * t * control1.x +
+          3 * inverse * squared * control2.x +
+          squared * t * end.x,
+        y:
+          inverseSquared * inverse * start.y +
+          3 * inverseSquared * t * control1.y +
+          3 * inverse * squared * control2.y +
+          squared * t * end.y
+      };
+    }
+
+    getHeartPathControlPoints(geometry = this.journeyGeometry) {
+      if (!geometry) return null;
+
+      const start = geometry.heartStartCenter;
+      const end = geometry.heartEndCenter;
+      const deltaX = end.x - start.x;
+      const deltaY = end.y - start.y;
+      const requiredClearance = Math.max(
+        0,
+        geometry.wordmarkStartBottom +
+          geometry.heartSourceHeight / 2 -
+          start.y
+      );
+      const desiredDrop = Math.max(
+        Math.min(
+          SETTINGS.heartPathMaxDepth,
+          geometry.viewportHeight * SETTINGS.heartPathDepthViewport
+        ),
+        requiredClearance * 1.35
+      );
+      const bow = Math.max(0, desiredDrop - Math.max(0, deltaY));
+
+      return {
+        first: {
+          x: start.x,
+          y: start.y + deltaY / 3 + bow
+        },
+        second: {
+          x:
+            start.x +
+            deltaX * SETTINGS.heartPathSecondControlX,
+          y: start.y + (2 * deltaY) / 3 + bow
+        }
+      };
+    }
+
+    getHeartPathCenter(progress, geometry = this.journeyGeometry) {
+      const controls = this.getHeartPathControlPoints(geometry);
+      if (!geometry || !controls) return null;
+
+      return this.cubicBezierPoint(
+        geometry.heartStartCenter,
+        controls.first,
+        controls.second,
+        geometry.heartEndCenter,
+        progress
+      );
+    }
+
+    getHeartViewportCenter(progress, scrollY) {
+      const geometry = this.journeyGeometry;
+      if (!geometry) return null;
+
+      if (progress <= 0.0001) {
+        /*
+         * Derive the source from the stationary authored stage. Offset-based
+         * geometry deliberately ignores the active/inactive transition
+         * transforms, so a large reverse jump cannot strand the overlay heart
+         * below the clipping window.
+         */
+        const stickyRect = this.sticky.getBoundingClientRect();
+        const stageCenter = {
+          x: stickyRect.left + geometry.stageLocalCenter.x,
+          y: stickyRect.top + geometry.stageLocalCenter.y
+        };
+
+        return {
+          x:
+            stageCenter.x +
+            (geometry.heartLocalCenter.x -
+              geometry.stageElementCenter.x),
+          y:
+            stageCenter.y +
+            (geometry.heartLocalCenter.y -
+              geometry.stageElementCenter.y)
+        };
+      }
+
+      if (progress < 1) {
+        return this.getHeartPathCenter(progress, geometry);
+      }
+
+      return (
+        this.getLiveHeartTargetCenter() || {
+          x:
+            geometry.targetFinalDocument.centerX -
+            (window.scrollX || 0),
+          y: geometry.targetFinalDocument.centerY - scrollY
+        }
+      );
+    }
+
+    getWordmarkFadeEndProgress(geometry = this.journeyGeometry) {
+      if (!geometry) return 1;
+
+      const targetTop = geometry.wordmarkStartBottom;
+      const halfHeartHeight = geometry.heartSourceHeight / 2;
+      const sampleCount = 64;
+      let lower = 0;
+
+      for (let index = 1; index <= sampleCount; index += 1) {
+        const upper = index / sampleCount;
+        const center = this.getHeartPathCenter(upper, geometry);
+
+        if (center && center.y - halfHeartHeight >= targetTop) {
+          let low = lower;
+          let high = upper;
+
+          for (let iteration = 0; iteration < 12; iteration += 1) {
+            const middle = (low + high) / 2;
+            const middleCenter = this.getHeartPathCenter(
+              middle,
+              geometry
+            );
+
+            if (
+              middleCenter &&
+              middleCenter.y - halfHeartHeight >= targetTop
+            ) {
+              high = middle;
+            } else {
+              low = middle;
+            }
+          }
+
+          return high;
+        }
+
+        lower = upper;
+      }
+
+      return 1;
+    }
+
+    getWordmarkFadeProgress(heartProgress, heartCenter) {
+      const geometry = this.journeyGeometry;
+      if (!geometry || !heartCenter || heartProgress <= 0.0001) {
+        return 0;
+      }
+
+      if (
+        heartProgress >=
+        geometry.wordmarkFadeEndProgress - 0.0001
+      ) {
+        return 1;
+      }
+
+      const sourceTop =
+        geometry.heartStartCenter.y -
+        geometry.heartSourceHeight / 2;
+      const currentTop =
+        heartCenter.y - geometry.heartSourceHeight / 2;
+      const fadeDistance = Math.max(
+        1,
+        geometry.wordmarkStartBottom - sourceTop
+      );
+
+      return this.clamp01(
+        (currentTop - sourceTop) / fadeDistance
+      );
+    }
+
+    renderWordmarkFade(fadeProgress) {
+      if (!this.inactiveLogo) return;
+
+      const progress = this.clamp01(fadeProgress);
+      const opacity = 1 - progress;
+      this.wordmarkFadeProgress = progress;
+      this.wordmarkOpacity = opacity;
+      this.inactiveState =
+        progress >= 0.9999 ? "hidden" : "visible";
+
+      if (this.mode === "scrolled") {
+        this.gsap.set(this.inactive, { autoAlpha: 1 });
+      }
+
+      this.gsap.set(this.inactiveLogo, {
+        autoAlpha: opacity,
+        yPercent: 0,
+        rotation: 0,
+        transformOrigin: "0% 50%",
+        force3D: true
+      });
     }
 
     getLiveHeartTargetCenter() {
@@ -807,6 +1013,122 @@
         });
     }
 
+    detachPulseToOverlay() {
+      if (
+        this.pulseDetached ||
+        !this.finalPulse ||
+        !this.heartOverlay
+      ) {
+        return;
+      }
+
+      if (!this.heartOverlay.isConnected) {
+        document.body.appendChild(this.heartOverlay);
+      }
+
+      const pulseRect = this.finalPulse.getBoundingClientRect();
+      const overlayRect = this.heartOverlay.getBoundingClientRect();
+      const measuredScaleX = Number(
+        this.gsap.getProperty(this.finalPulse, "scaleX")
+      );
+      const measuredScaleY = Number(
+        this.gsap.getProperty(this.finalPulse, "scaleY")
+      );
+      const scaleX = Number.isFinite(measuredScaleX)
+        ? measuredScaleX
+        : 1;
+      const scaleY = Number.isFinite(measuredScaleY)
+        ? measuredScaleY
+        : 1;
+      const width =
+        this.finalPulse.offsetWidth ||
+        pulseRect.width / Math.max(0.0001, Math.abs(scaleX));
+      const height =
+        this.finalPulse.offsetHeight ||
+        pulseRect.height / Math.max(0.0001, Math.abs(scaleY));
+      const center = {
+        x: pulseRect.left + pulseRect.width / 2,
+        y: pulseRect.top + pulseRect.height / 2
+      };
+
+      this.heartOverlay.appendChild(this.finalPulse);
+      this.pulseDetached = true;
+      this.gsap.set(this.finalPulse, {
+        position: "absolute",
+        top: 0,
+        right: "auto",
+        bottom: "auto",
+        left: 0,
+        width,
+        height,
+        margin: 0,
+        x: center.x - overlayRect.left - width / 2,
+        y: center.y - overlayRect.top - height / 2,
+        xPercent: 0,
+        yPercent: 0,
+        scaleX,
+        scaleY,
+        zIndex: 2,
+        transformOrigin: "50% 50%",
+        force3D: false,
+        autoRound: false
+      });
+    }
+
+    reattachPulseToTarget() {
+      if (
+        !this.pulseDetached ||
+        !this.finalPulse ||
+        !this.originalPulseParent
+      ) {
+        return;
+      }
+
+      const measuredScaleX = Number(
+        this.gsap.getProperty(this.finalPulse, "scaleX")
+      );
+      const measuredScaleY = Number(
+        this.gsap.getProperty(this.finalPulse, "scaleY")
+      );
+      const measuredOpacity = Number(
+        this.gsap.getProperty(this.finalPulse, "opacity")
+      );
+      const scaleX = Number.isFinite(measuredScaleX)
+        ? measuredScaleX
+        : 0;
+      const scaleY = Number.isFinite(measuredScaleY)
+        ? measuredScaleY
+        : 0;
+      const opacity = Number.isFinite(measuredOpacity)
+        ? measuredOpacity
+        : 0;
+
+      if (
+        this.originalPulseNextSibling?.parentNode ===
+        this.originalPulseParent
+      ) {
+        this.originalPulseParent.insertBefore(
+          this.finalPulse,
+          this.originalPulseNextSibling
+        );
+      } else {
+        this.originalPulseParent.appendChild(this.finalPulse);
+      }
+
+      this.pulseDetached = false;
+      this.gsap.set(this.finalPulse, {
+        clearProps:
+          "position,top,right,bottom,left,width,height,margin,zIndex,transform"
+      });
+      this.gsap.set(this.finalPulse, {
+        autoAlpha: opacity,
+        scaleX,
+        scaleY,
+        transformOrigin: "50% 50%",
+        force3D: false
+      });
+    }
+
     createMorphTimeline() {
       if (!this.journeyReady || !this.journeyGeometry) return;
 
@@ -954,6 +1276,7 @@
       this.pulseVisible = true;
       this.pulseRevealTween?.kill();
       this.pulseRevealTween = null;
+      this.reattachPulseToTarget();
       this.pulseRunning = false;
       this.pulseTimeline?.pause(0);
       this.gsap.set(this.pulseGraphic, {
@@ -1008,13 +1331,9 @@
 
     stopPulse({ hide = true, immediate = false } = {}) {
       this.pulseRunning = false;
-      this.pulseTimeline?.pause(0);
-      this.gsap.set(this.pulseGraphic, {
-        scale: 1,
-        force3D: false
-      });
 
       if (!hide) {
+        this.pulseTimeline?.pause();
         this.pulseRevealTween?.pause();
         return;
       }
@@ -1026,12 +1345,18 @@
         if (shouldHideImmediately && this.finalPulse) {
           this.pulseRevealTween?.kill();
           this.pulseRevealTween = null;
+          this.pulseTimeline?.pause(0);
+          this.gsap.set(this.pulseGraphic, {
+            scale: 1,
+            force3D: false
+          });
           this.gsap.set(this.finalPulse, {
             autoAlpha: 0,
             scale: 0,
             transformOrigin: "50% 50%",
             force3D: false
           });
+          this.reattachPulseToTarget();
         }
         return;
       }
@@ -1043,15 +1368,48 @@
       if (!this.finalPulse) return;
 
       if (shouldHideImmediately) {
+        this.pulseTimeline?.pause(0);
+        this.gsap.set(this.pulseGraphic, {
+          scale: 1,
+          force3D: false
+        });
         this.gsap.set(this.finalPulse, {
           autoAlpha: 0,
           scale: 0,
           transformOrigin: "50% 50%",
           force3D: false
         });
+        this.reattachPulseToTarget();
         return;
       }
 
+      /*
+       * Transfer the current heartbeat scale to the outer wrapper in the same
+       * frame, then normalize the inner SVG. The complete visible pulse (up to
+       * 1.1053) can now shrink to zero as one reversible object without a snap
+       * if the user changes direction during the hide.
+       * Temporarily placing the pulse in the fixed overlay keeps it above the
+       * reversing red morph, which otherwise masks this scale-out.
+       */
+      const outerScaleX =
+        Number(this.gsap.getProperty(this.finalPulse, "scaleX")) || 0;
+      const outerScaleY =
+        Number(this.gsap.getProperty(this.finalPulse, "scaleY")) || 0;
+      const innerScaleX =
+        Number(this.gsap.getProperty(this.pulseGraphic, "scaleX")) || 1;
+      const innerScaleY =
+        Number(this.gsap.getProperty(this.pulseGraphic, "scaleY")) || 1;
+      this.pulseTimeline?.pause(0);
+      this.gsap.set(this.pulseGraphic, {
+        scale: 1,
+        force3D: false
+      });
+      this.gsap.set(this.finalPulse, {
+        scaleX: outerScaleX * innerScaleX,
+        scaleY: outerScaleY * innerScaleY,
+        force3D: false
+      });
+      this.detachPulseToOverlay();
       this.gsap.set(this.finalPulse, {
         autoAlpha: 1,
         transformOrigin: "50% 50%",
@@ -1073,11 +1431,17 @@
           }
 
           this.pulseRevealTween = null;
+          this.pulseTimeline?.pause(0);
+          this.gsap.set(this.pulseGraphic, {
+            scale: 1,
+            force3D: false
+          });
           this.gsap.set(this.finalPulse, {
             autoAlpha: 0,
             scale: 0,
             force3D: false
           });
+          this.reattachPulseToTarget();
         }
       });
       this.pulseRevealTween = hideTween;
@@ -1382,15 +1746,14 @@
       }
 
       /*
-       * While the phase-two wordmark transition is running, the overlay keeps
-       * the heart independent from the clipping logo stage. Reattach only after
-       * the inactive logo is fully restored.
+       * Keep the travelling heart outside the clipping stage until both the
+       * scroll-owned wordmark fade and the path itself are fully reversed.
        */
-      if (!force && this.inactiveTimeline) {
-        return;
-      }
-
-      if (!force && this.inactiveState !== "visible") {
+      if (
+        !force &&
+        (this.wordmarkFadeProgress > 0.001 ||
+          this.heartJourneyProgress > 0.001)
+      ) {
         return;
       }
 
@@ -1473,8 +1836,15 @@
         this.heartMarker,
         this.stage
       );
+      const inactiveLogoOffset = this.getOffsetWithin(
+        this.inactiveLogo,
+        this.stage
+      );
       const stageWidth = this.stage.offsetWidth;
       const stageHeight = this.stage.offsetHeight;
+      const inactiveLogoHeight =
+        this.inactiveLogo.offsetHeight ||
+        this.inactiveLogo.getBoundingClientRect().height;
       const heartMarkerStyle = window.getComputedStyle(this.heartMarker);
       const heartSourceWidth =
         this.readPixelValue(heartMarkerStyle.width) ||
@@ -1486,9 +1856,13 @@
         this.heartMarker.getBoundingClientRect().height;
 
       if (
-        [stageWidth, stageHeight, heartSourceWidth, heartSourceHeight].some(
-          (value) => !Number.isFinite(value) || value <= 0
-        )
+        [
+          stageWidth,
+          stageHeight,
+          inactiveLogoHeight,
+          heartSourceWidth,
+          heartSourceHeight
+        ].some((value) => !Number.isFinite(value) || value <= 0)
       ) {
         return false;
       }
@@ -1548,6 +1922,11 @@
       const stickyTop =
         this.readPixelValue(window.getComputedStyle(this.sticky).top) || 0;
       const stickyRect = this.sticky.getBoundingClientRect();
+      const wordmarkStartBottom =
+        stickyTop +
+        stageOffset.y +
+        inactiveLogoOffset.y +
+        inactiveLogoHeight;
       const stageLocalCenter = {
         x: stageOffset.x + stageWidth / 2,
         y: stageOffset.y + stageHeight / 2
@@ -1584,6 +1963,8 @@
         heartLocalCenter,
         stageStartCenter,
         heartStartCenter,
+        wordmarkStartBottom,
+        wordmarkFadeEndProgress: 1,
         heartEndCenter: {
           x: targetFinalDocument.centerX - scrollX,
           y: targetFinalDocument.centerY - mapEndScroll
@@ -1594,6 +1975,8 @@
         heartSourceWidth,
         heartSourceHeight
       };
+      this.journeyGeometry.wordmarkFadeEndProgress =
+        this.getWordmarkFadeEndProgress(this.journeyGeometry);
 
       /*
        * A width/orientation change also changes the authored vw-sized heart.
@@ -1617,131 +2000,6 @@
 
     getJourneyProgress(scrollY, start, end) {
       return this.clamp01((scrollY - start) / Math.max(1, end - start));
-    }
-
-    setInactiveJourneyState(
-      nextState,
-      { immediate = false, force = false } = {}
-    ) {
-      if (
-        !this.journeyReady ||
-        !this.inactiveLogo ||
-        (nextState !== "visible" && nextState !== "hidden")
-      ) {
-        return;
-      }
-
-      if (!force && this.inactiveState === nextState) return;
-
-      const version = ++this.inactiveVersion;
-      this.inactiveTimeline?.kill();
-      this.inactiveTimeline = null;
-      this.inactiveState = nextState;
-
-      const shouldSetImmediately =
-        immediate || this.reducedMotionQuery.matches;
-
-      if (shouldSetImmediately) {
-        this.gsap.set(this.inactiveLogo, {
-          autoAlpha: nextState === "visible" ? 1 : 0,
-          yPercent:
-            nextState === "visible" ? 0 : SETTINGS.outgoingYPercent,
-          rotation:
-            nextState === "visible" ? 0 : SETTINGS.outgoingRotation,
-          transformOrigin:
-            nextState === "visible" ? "0% 50%" : "100% 50%",
-          force3D: true
-        });
-        if (this.mode === "scrolled") {
-          this.gsap.set(this.inactive, {
-            autoAlpha: nextState === "visible" ? 1 : 0
-          });
-        }
-        return;
-      }
-
-      /*
-       * At phase two the wordmark and travelling heart become independent.
-       * The invisible marker preserves the exact authored source geometry for
-       * deterministic reverse scrolling and responsive rebuilds.
-       */
-      if (nextState === "hidden") {
-        this.ensureHeartDetached();
-      } else if (this.mode === "scrolled") {
-        this.gsap.set(this.inactive, { autoAlpha: 1 });
-      }
-
-      /*
-       * The phase-two boundary reuses the directional halves of Codrops
-       * variant 6: 150 ms above on the way down, 600 ms from below with the
-       * same back ease on reverse. The heart is a sibling of inactiveLogo, so
-       * it keeps following the scroll-owned path independently.
-       */
-      this.gsap.set(this.inactiveLogo, {
-        autoAlpha: 1,
-        yPercent:
-          nextState === "hidden" ? 0 : SETTINGS.incomingYPercent,
-        rotation:
-          nextState === "hidden" ? 0 : SETTINGS.incomingRotation,
-        transformOrigin:
-          nextState === "hidden" ? "100% 50%" : "0% 50%",
-        force3D: true
-      });
-
-      this.inactiveTimeline = this.gsap.timeline({
-        onComplete: () => {
-          if (
-            this.destroyed ||
-            version !== this.inactiveVersion ||
-            this.inactiveState !== nextState
-          ) {
-            return;
-          }
-
-          this.gsap.set(this.inactiveLogo, {
-            autoAlpha: nextState === "visible" ? 1 : 0,
-            yPercent:
-              nextState === "visible" ? 0 : SETTINGS.outgoingYPercent,
-            rotation:
-              nextState === "visible" ? 0 : SETTINGS.outgoingRotation
-          });
-          if (nextState === "hidden" && this.mode === "scrolled") {
-            this.gsap.set(this.inactive, { autoAlpha: 0 });
-          }
-          this.inactiveTimeline = null;
-
-          if (
-            nextState === "visible" &&
-            this.heartJourneyProgress <= 0.001 &&
-            (!this.morphTimeline ||
-              this.morphTimeline.progress() <= 0.001)
-          ) {
-            this.reattachHeart();
-          }
-        }
-      });
-
-      this.inactiveTimeline.to(
-        this.inactiveLogo,
-        nextState === "hidden"
-          ? {
-            duration: SETTINGS.outgoingDuration,
-            yPercent: SETTINGS.outgoingYPercent,
-            rotation: SETTINGS.outgoingRotation,
-            transformOrigin: "100% 50%",
-            ease: SETTINGS.outgoingEase,
-            overwrite: true
-          }
-          : {
-            duration: SETTINGS.incomingDuration,
-            yPercent: 0,
-            rotation: 0,
-            transformOrigin: "0% 50%",
-            ease: SETTINGS.incomingEase,
-            overwrite: true
-          },
-        0
-      );
     }
 
     resetDeferredHeartTravel({ resetProgress = true } = {}) {
@@ -1771,19 +2029,20 @@
       );
     }
 
-    getInactiveExitScroll() {
+    getWordmarkFadeCompleteScroll() {
       if (!this.journeyGeometry) return 0;
 
-      const exitEndScroll = Math.max(
-        this.journeyGeometry.phase2StartScroll + 1,
+      const startScroll =
+        this.heartDeferredStartScroll ??
+        this.journeyGeometry.heartStartScroll;
+      const endScroll =
         this.heartDeferredEndScroll ??
-          this.journeyGeometry.mapEndScroll
-      );
+        this.journeyGeometry.mapEndScroll;
 
       return this.lerp(
-        this.journeyGeometry.phase2StartScroll,
-        exitEndScroll,
-        SETTINGS.inactiveExitDelayProgress
+        startScroll,
+        endScroll,
+        this.journeyGeometry.wordmarkFadeEndProgress
       );
     }
 
@@ -1900,11 +2159,6 @@
         renderedHeartProgress = rawHeartProgress;
       }
 
-      const phase2Entered =
-        !forceReset &&
-        !takeoverLocked &&
-        !deferredHeartWaiting &&
-        scrollY >= this.getInactiveExitScroll();
       let finalPhase = false;
 
       if (takeoverLocked || deferredHeartWaiting) {
@@ -1931,12 +2185,18 @@
       this.heartJourneyProgress = heartProgress;
       this.mapJourneyProgress = mapProgress;
 
-      this.setInactiveJourneyState(
-        phase2Entered ? "hidden" : "visible",
-        {
-          immediate: immediate || forceReset
-        }
+      const heartCenter = this.getHeartViewportCenter(
+        heartProgress,
+        scrollY
       );
+      const wordmarkFadeProgress =
+        forceReset || takeoverLocked || deferredHeartWaiting
+          ? 0
+          : this.getWordmarkFadeProgress(
+              heartProgress,
+              heartCenter
+            );
+      this.renderWordmarkFade(wordmarkFadeProgress);
       this.gsap.set(this.map, {
         width: `${this.lerp(
           SETTINGS.mapStartWidth,
@@ -1966,55 +2226,6 @@
           (this.morphTimeline?.progress() || 0) > 0.001)
       ) {
         this.ensureHeartDetached();
-
-        const easedHeart = this.easeInOut(heartProgress);
-        let heartCenter;
-
-        if (heartProgress <= 0.0001) {
-          /*
-           * Derive the source from the stationary authored stage. Offset-based
-           * geometry deliberately ignores the active/inactive transition
-           * transforms, so a large reverse jump cannot strand the overlay
-           * heart below the clipping window.
-           */
-          const stickyRect = this.sticky.getBoundingClientRect();
-          const stageCenter = {
-            x: stickyRect.left + geometry.stageLocalCenter.x,
-            y: stickyRect.top + geometry.stageLocalCenter.y
-          };
-          heartCenter = {
-            x:
-              stageCenter.x +
-              (geometry.heartLocalCenter.x -
-                geometry.stageElementCenter.x),
-            y:
-              stageCenter.y +
-              (geometry.heartLocalCenter.y -
-                geometry.stageElementCenter.y)
-          };
-        } else if (heartProgress < 1) {
-          heartCenter = {
-            x: this.lerp(
-              geometry.heartStartCenter.x,
-              geometry.heartEndCenter.x,
-              easedHeart
-            ),
-            y: this.lerp(
-              geometry.heartStartCenter.y,
-              geometry.heartEndCenter.y,
-              easedHeart
-            )
-          };
-        } else {
-          heartCenter =
-            this.getLiveHeartTargetCenter() || {
-              x:
-                geometry.targetFinalDocument.centerX -
-                (window.scrollX || 0),
-              y: geometry.targetFinalDocument.centerY - scrollY
-            };
-        }
-
         this.setOverlayHeartCenter(heartCenter);
       }
 
@@ -2489,10 +2700,7 @@
         this.finalPhaseActive = false;
 
         if (this.journeyReady) {
-          this.setInactiveJourneyState("visible", {
-            immediate: true,
-            force: true
-          });
+          this.renderWordmarkFade(0);
           this.requestMorph(false, { immediate: true });
           this.reattachHeart({ force: true });
         }
@@ -2944,9 +3152,6 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
-      this.inactiveVersion += 1;
-      this.inactiveTimeline?.kill();
-      this.inactiveTimeline = null;
       this.inactiveState = null;
       this.heartTravelLocked = false;
       this.resetDeferredHeartTravel();
@@ -2978,9 +3183,6 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
-      this.inactiveVersion += 1;
-      this.inactiveTimeline?.kill();
-      this.inactiveTimeline = null;
       this.inactiveState = null;
       this.heartTravelLocked = false;
       this.resetDeferredHeartTravel();
@@ -3014,10 +3216,9 @@
         journeyReady: this.journeyReady,
         phase2Progress: this.phase2Progress,
         inactiveState: this.inactiveState,
-        inactiveTransitionActive: Boolean(
-          this.inactiveTimeline &&
-            this.inactiveTimeline.isActive()
-        ),
+        inactiveTransitionActive: false,
+        wordmarkFadeProgress: this.wordmarkFadeProgress,
+        wordmarkOpacity: this.wordmarkOpacity,
         heartScrollProgress: this.heartScrollProgress,
         heartProgress: this.heartJourneyProgress,
         heartTravelLocked: this.heartTravelLocked,
@@ -3041,6 +3242,7 @@
         morphProgress: this.morphTimeline?.progress() || 0,
         pulseActive: this.pulseRunning,
         pulseVisible: this.pulseVisible,
+        pulseDetached: this.pulseDetached,
         pulseTransitionActive: Boolean(
           this.pulseRevealTween &&
             this.pulseRevealTween.isActive()
@@ -3050,7 +3252,9 @@
               start: this.journeyGeometry.stageStartScroll,
               heartDeparture: this.journeyGeometry.heartStartScroll,
               phase2Entry: this.journeyGeometry.phase2StartScroll,
-              inactiveExit: this.getInactiveExitScroll(),
+              inactiveExit: this.getWordmarkFadeCompleteScroll(),
+              wordmarkFadeComplete:
+                this.getWordmarkFadeCompleteScroll(),
               heartLanding: this.journeyGeometry.mapEndScroll
             }
           : null
@@ -3065,9 +3269,6 @@
       this.stateVersion += 1;
       this.stateTimeline?.kill();
       this.stateTimeline = null;
-      this.inactiveVersion += 1;
-      this.inactiveTimeline?.kill();
-      this.inactiveTimeline = null;
       this.heartTravelLocked = false;
       this.resetDeferredHeartTravel();
       this.morphTimeline?.kill();
@@ -3077,6 +3278,7 @@
       this.pulseRunning = false;
       this.pulseRevealTween?.kill();
       this.pulseRevealTween = null;
+      this.reattachPulseToTarget();
       this.reattachHeart({ force: true });
 
       if (this.scrollFrame) window.cancelAnimationFrame(this.scrollFrame);
